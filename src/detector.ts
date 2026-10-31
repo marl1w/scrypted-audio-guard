@@ -6,14 +6,16 @@
 //   - Loud impulse: one window (100 ms) whose level is at least floor + impulseDb and at least impulseMinDb. A bang, a
 //     door slam or breaking glass counts at once, however short.
 //   - Sustained: windows whose sustained level (their quieter 50 ms half) is at least floor + sensitivity and at least
-//     absMinDb, for minSustainedWindows (1 s). Gaps of up to gapWindows quiet windows (between syllables or steps) do
-//     not break it. A faint click or a short glitch of the camera never lasts that long.
+//     absMinDb, for minSustainedWindows (1 s), at least MIN_LOUD_SHARE of them loud. Gaps of up to gapWindows quiet
+//     windows (between syllables or steps) do not break it. A faint click or a short glitch of the camera never lasts
+//     that long.
 // - Hold: detected stays on until holdMs after the last spike window.
 // - Step change: when the background itself jumps (a fan, rain) the loud windows stay out of the floor. A "run" starts
 //   at the first loud window and records EVERY window from then on (quiet gaps included) until runGapWindows quiet
 //   windows in a row end it. Once the run's last rebaselineWindows (60 s) are steady (interquartile spread at most
-//   steadySpreadDb), the floor is rebuilt from them, so the sensor does not stay on forever. Speech-like bursts are
-//   not steady and never become the floor.
+//   steadySpreadDb) and their median is below impulseMinDb, the floor is rebuilt from them, so the sensor does not
+//   stay on forever. Speech-like bursts are not steady, and a loud steady sound (an idling engine, an alarm) is not
+//   background: neither becomes the floor.
 // - Digital silence: silenceWindows (60 s) in a row at or below silenceDb sets `silent` (a status only: gated or
 //   noise-suppressed cameras send exact zeros in a quiet room, and detection goes on). It clears after
 //   silenceClearWindows (2 s) of audio at or above absMinDb.
@@ -21,7 +23,8 @@
 import { MIN_DB, WINDOW_MS, WindowLevel } from './pcm';
 
 export interface DetectorConfig {
-    /** dB above the noise floor that counts as a spike. */
+    /** dB above the noise floor that a window's sustained level must reach for a sustained sound (windows this far
+     *  above the floor are also kept out of it). */
     sensitivityDb: number;
     /** how long detected stays on after the last spike. */
     holdMs: number;
@@ -61,6 +64,8 @@ export const DEFAULT_MIN_LEVEL_DB = -45;
 export const DEFAULT_DURATION_S = 1;
 export const DEFAULT_IMPULSE_DB = 25;
 export const DEFAULT_IMPULSE_LEVEL_DB = -30;
+/** a sustained sound needs at least this share of minSustainedWindows to be loud windows (gaps do not count) */
+export const MIN_LOUD_SHARE = 0.6;
 
 export const DEFAULT_DETECTOR: DetectorConfig = {
     sensitivityDb: DEFAULT_SENSITIVITY_DB,
@@ -98,8 +103,6 @@ export interface PushResult {
     rebaselined: boolean;
     /** this window counted as a spike (it set or extended the detection) */
     spike: boolean;
-    /** the spike was a loud impulse (else a sustained sound) */
-    impulse: boolean;
 }
 
 export class AudioDetector {
@@ -120,11 +123,18 @@ export class AudioDetector {
     silent = false;
     /** windows of the current sustained sound, its short gaps included (0 = none) */
     private sustained = 0;
+    /** loud windows in the current sustained sound, and when its first one came */
+    private loudCount = 0;
+    private sustainedStart = 0;
     private gap = 0;
     private silentRun = 0;
     private cachedFloor: number | undefined;
     detected = false;
     lastSpikeAt: number | undefined;
+    /** the last spike window's level above the floor (dB) */
+    lastSpikeExcessDb: number | undefined;
+    /** the current sound's first loud window (monotonic ms), for either tier; set when detected turns on */
+    soundStartAt: number | undefined;
     /** wall-clock time of the last spike, for the status line */
     lastSpikeWall: number | undefined;
     lastDb: number | undefined;
@@ -175,11 +185,12 @@ export class AudioDetector {
         this.runHist[bin]++;
     }
 
-    /** the full run window is steady: interquartile spread at most steadySpreadDb */
-    private runSteady(): boolean {
+    /** the full run window is a new background: steady (interquartile spread at most steadySpreadDb) and below the
+     *  loud sound level (an idling engine or an alarm next to the camera is a sound, not background) */
+    private runIsBackground(): boolean {
         const p25 = percentileOf(this.runHist, this.runSize, 0.25);
         const p75 = percentileOf(this.runHist, this.runSize, 0.75);
-        return p75 - p25 <= this.config.steadySpreadDb;
+        return p75 - p25 <= this.config.steadySpreadDb && percentileOf(this.runHist, this.runSize, 0.5) < this.config.impulseMinDb;
     }
 
     push(w: WindowLevel, now: number): PushResult {
@@ -200,7 +211,7 @@ export class AudioDetector {
             this.runGap = flagged ? 0 : this.runGap + 1;
             if (this.runGap >= c.runGapWindows)
                 this.endRun();
-            else if (this.runSize >= c.rebaselineWindows && this.runSteady()) {
+            else if (this.runSize >= c.rebaselineWindows && this.runIsBackground()) {
                 this.rebuild(this.runRing.subarray(0, this.runSize));
                 this.endRun();
                 rebaselined = true;
@@ -208,7 +219,12 @@ export class AudioDetector {
         }
 
         if (loud) {
+            if (this.sustained === 0) {
+                this.sustainedStart = now;
+                this.loudCount = 0;
+            }
             this.sustained++;
+            this.loudCount++;
             this.gap = 0;
         }
         else if (this.sustained > 0 && ++this.gap <= c.gapWindows)
@@ -216,9 +232,12 @@ export class AudioDetector {
         else
             this.sustained = 0;
         const before = this.detected;
-        const spike = impulse || (loud && this.sustained >= c.minSustainedWindows);
+        const spike = impulse || (loud && this.sustained >= c.minSustainedWindows && this.loudCount >= Math.ceil(MIN_LOUD_SHARE * c.minSustainedWindows));
         if (spike) {
+            if (!this.detected)
+                this.soundStartAt = this.sustained > 0 ? this.sustainedStart : now;
             this.lastSpikeAt = now;
+            this.lastSpikeExcessDb = (impulse ? w.db : w.sustainedDb) - floor!;
             this.lastSpikeWall = this.wall();
             this.detected = true;
         }
@@ -238,7 +257,7 @@ export class AudioDetector {
         if (this.silent && w.db >= c.absMinDb && ++this.soundRun >= c.silenceClearWindows)
             this.silent = false;
 
-        return { changed: before !== this.detected, detected: this.detected, silentChanged: wasSilent !== this.silent, rebaselined, spike, impulse: spike && impulse };
+        return { changed: before !== this.detected, detected: this.detected, silentChanged: wasSilent !== this.silent, rebaselined, spike };
     }
 
     /** ms until the hold ends (0 = ended or not detected). */
@@ -284,10 +303,9 @@ export class AudioDetector {
         this.hist.fill(0);
         this.head = 0;
         this.size = 0;
-        // the floor history must be trusted at once: repeat the run if it is shorter than the learning period
-        const n = Math.max(bins.length, this.config.learnWindows);
-        for (let i = 0; i < n; i++)
-            this.add(bins[i % bins.length], false);
+        // the run holds rebaselineWindows (60 s), more than learnWindows: the floor is trusted at once
+        for (let i = 0; i < bins.length; i++)
+            this.add(bins[i], false);
         this.cachedFloor = percentileOf(this.hist, this.size, this.config.floorPercentile);
     }
 }

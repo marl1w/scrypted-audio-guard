@@ -275,36 +275,181 @@ test('provider page: Overview and Performance html, one row per camera, totals a
     await p.releaseMixin('c1', m);
 });
 
-test('provider: a sound most cameras hear at the same moment is background and ignored; a sound at one camera is published 1 s later', async () => {
+/** A provider with `n` cameras (fake clock and ffmpeg), all past the start jitter and the learning (floor -60 dBFS). */
+async function fleet(n: number, store: Record<string, string> = {}) {
     const p = new AudioGuardProvider('n');
+    p.stopPerf();
     const clock = new FakeClock();
     const host = p as any;
     host.timers = clock;
-    const feeds: ((w: WindowLevel) => void)[] = [];
-    host.starter = () => async (onWindow: (w: WindowLevel) => void) => { feeds.push(onWindow); return { stop() { }, exited: new Promise(() => { }) } as AudioProcess; };
+    const feeds = new Map<AudioGuardMixin, (w: WindowLevel) => void>();
+    const ends = new Map<AudioGuardMixin, (e?: string) => void>();
+    host.starter = (m: AudioGuardMixin) => async (onWindow: (w: WindowLevel) => void) => {
+        feeds.set(m, onWindow);
+        const exited = new Promise<string | undefined>(r => ends.set(m, r));
+        return { stop() { }, exited } as AudioProcess;
+    };
     const ms: AudioGuardMixin[] = [];
-    for (let i = 0; i < 5; i++)
-        ms.push(await p.getMixin({}, [] as any, { id: `c${i}`, store: {} } as any));
+    for (let i = 0; i < n; i++)
+        ms.push(await p.getMixin({}, [] as any, { id: `c${i}`, store: { ...store } } as any));
     clock.advance(START_JITTER_MS);
     await flush();
-    /** one window to each camera; loud ones get `db` */
-    const tick = (db: number, loud: number[]) => { clock.advance(100); feeds.forEach((f, i) => { const v = loud.includes(i) ? db : -60; f({ db: v, sustainedDb: v }); }); };
-    for (let i = 0; i < 150; i++)
-        tick(-60, []);
-    // 3 of 5 (60 %) within 1 s: a distant bang, wind
+    /** `k` windows to each running camera: `db(i)` for camera i, -60 dBFS for the others */
+    const tick = (db: number | ((i: number) => number), loud: number[] = [], k = 1) => {
+        for (let j = 0; j < k; j++) {
+            clock.advance(100);
+            ms.forEach((m, i) => {
+                if (m.runner.state !== 'running')
+                    return;
+                const v = !loud.includes(i) ? -60 : typeof db === 'number' ? db : db(i);
+                feeds.get(m)!({ db: v, sustainedDb: v });
+            });
+        }
+    };
+    tick(-60, [], 150);
+    const logs = (i: number) => ((ms[i] as any).logs as string[]).filter(l => l.startsWith('background check'));
+    const done = async () => { for (let i = 0; i < n; i++) await p.releaseMixin(`c${i}`, ms[i]); };
+    return { p, clock, ms, tick, ends, logs, done };
+}
+
+test('background check: a sound 4 of 5 cameras hear alike is ignored; a sound at one camera is published 1 s later', async () => {
+    const { ms, tick, clock, logs, done } = await fleet(5);
     tick(-20, [0, 1]);
-    for (let i = 0; i < 5; i++) tick(-60, []);
-    tick(-20, [2]);
-    for (let i = 0; i < 30; i++) tick(-60, []);
+    tick(-60, [], 5);
+    tick(-20, [2, 3]);
+    tick(-60, [], 30);
     assert.ok(ms.every(m => !m.audioDetected));
     assert.ok(ms.every(m => m.detections.sum(clock.now()) === 0));
+    assert.match(logs(0)[0], /^background check: sound ignored, 3 of 4 other cameras heard it as loud at the same moment$/);
+    assert.equal(ms[0].shortState().state, 'Background');
+    assert.match(ms[0].statusText(), /^Background \(ignored by the background check\)/);
+    // 3 of 5 is not enough: each camera has only 2 of 4 others (needs 60 %, 3)
+    clock.advance(10_000);
+    tick(-20, [0, 1, 2]);
+    tick(-60, [], 10);
+    assert.ok([0, 1, 2].every(i => ms[i].audioDetected));
+    clock.advance(20_000);
     // one camera alone: published once the 1 s check has passed
     tick(-20, [3]);
     assert.ok(!ms[3].audioDetected, 'waits for the other cameras');
-    for (let i = 0; i < 10; i++) tick(-60, []);
+    tick(-60, [], 10);
     assert.equal(ms[3].audioDetected, true);
     assert.equal(ms[3].detections.sum(clock.now()), 1);
-    p.stopPerf();
-    for (let i = 0; i < 5; i++)
-        await p.releaseMixin(`c${i}`, ms[i]);
+    await done();
+});
+
+test('background check with 3 cameras: all 3 is background, 2 of 3 is published', async () => {
+    const { ms, tick, clock, done } = await fleet(3);
+    tick(-20, [0, 1, 2]);
+    tick(-60, [], 15);
+    assert.ok(ms.every(m => !m.audioDetected && m.background));
+    clock.advance(15_000);
+    tick(-20, [0, 1]);
+    tick(-60, [], 15);
+    assert.deepEqual(ms.map(m => !!m.audioDetected), [true, true, false]);
+    await done();
+});
+
+test('background check: fewer than 3 cameras listening, no check and no delay', async () => {
+    const { ms, tick, done } = await fleet(2);
+    tick(-20, [0, 1]);
+    assert.ok(ms.every(m => m.audioDetected), 'published at the first window');
+    await done();
+});
+
+test('background check: the camera where the sound is clearly loudest above its floor is not suppressed', async () => {
+    const { ms, tick, done } = await fleet(5);
+    // a bang next to camera 0 (+50 dB), heard by the four others at +30 dB
+    tick(i => i === 0 ? -10 : -30, [0, 1, 2, 3, 4]);
+    tick(-60, [], 15);
+    assert.equal(ms[0].audioDetected, true);
+    assert.ok([1, 2, 3, 4].every(i => !ms[i].audioDetected && ms[i].background));
+    await done();
+});
+
+test('background check: a sound that keeps going is not checked again; a new sound during it on another camera is background too', async () => {
+    const { ms, tick, logs, done } = await fleet(4);
+    // wind on cameras 1 to 3 for 30 s
+    tick(-20, [1, 2, 3], 100);
+    // camera 0 hears it 10 s later, for 1.5 s: the others' sound started long before, but goes on
+    tick(-20, [0, 1, 2, 3], 15);
+    tick(-20, [1, 2, 3], 185);
+    assert.ok(ms.every(m => !m.audioDetected));
+    assert.deepEqual([0, 1, 2, 3].map(i => logs(i).length), [1, 1, 1, 1], 'one check per camera');
+    assert.ok([1, 2, 3].every(i => ms[i].background && ms[i].detector.detected));
+    assert.ok(ms.every(m => m.detections.sum(m['now']()) === 0));
+    const html = ms[1].statusHtml();
+    assert.match(html, /<title>background, \d+ s<\/title>/);
+    assert.match(html, /a short loud sound counts when one 100 ms window reaches the floor \+ 25 dB and -30 dBFS \(now -30 dBFS\)/);
+    await done();
+});
+
+test('background check: the "sound ignored" log is rate-limited to one line a minute', async () => {
+    const { tick, logs, clock, done } = await fleet(3, { hold: '1' });
+    for (let k = 0; k < 13; k++) {
+        tick(-20, [0, 1, 2]);
+        tick(-60, [], 49); // 5 s apart, each a new sound (Hold 1 s)
+    }
+    assert.equal(clock.now() >= 60_000, true);
+    tick(-20, [0, 1, 2]);
+    tick(-60, [], 20);
+    assert.equal(logs(0).length, 2);
+    assert.match(logs(0)[1], /\(and 11 more since the last line\)$/);
+    await done();
+});
+
+test('background check: with Hold 1 s the sensor is on for Hold after the check turned it on', async () => {
+    const { ms, tick, clock, done } = await fleet(3, { hold: '1' });
+    const t0 = clock.now();
+    tick(-20, [0]);
+    clock.advance(900);
+    assert.equal(ms[0].audioDetected, undefined, 'not yet published');
+    clock.advance(600); // 1.5 s after the bang: the detector's own hold ended, the sensor is on since 1 s
+    assert.equal(ms[0].audioDetected, true);
+    clock.advance(500);
+    assert.equal(ms[0].audioDetected, false);
+    assert.equal(clock.now() - t0, 2100);
+    assert.deepEqual((ms[0] as any).writes, [true, false]);
+    await done();
+});
+
+test('background check: Hold counts from when the sensor turned on', async () => {
+    const { ms, tick, clock, done } = await fleet(3);
+    tick(-20, [0]);
+    clock.advance(10_050); // 10.05 s after the bang: the detector is off, the sensor (on at 1 s) stays on
+    assert.equal(ms[0].detector.detected, false);
+    assert.equal(ms[0].audioDetected, true);
+    clock.advance(1000);
+    assert.equal(ms[0].audioDetected, false);
+    await done();
+});
+
+for (const how of ['disabled', 'process ended', 'released'] as const) {
+    test(`background check: a pending sound is dropped and logged when the audio stops (${how})`, async () => {
+        const { ms, tick, ends, clock, logs, done } = await fleet(3);
+        tick(-20, [0]);
+        const logLines = (ms[0] as any).logs as string[];
+        if (how === 'disabled')
+            await ms[0].putMixinSetting('enabled', false);
+        else if (how === 'process ended') {
+            ends.get(ms[0])!('boom');
+            await flush();
+        }
+        else
+            await ms[0].release();
+        assert.ok(logLines.includes('background check: a pending sound was dropped, the audio stopped'), logs(0).join('|'));
+        clock.advance(5000);
+        assert.ok(!ms[0].audioDetected);
+        assert.deepEqual((ms[0] as any).writes.filter(Boolean), [], 'never published');
+        await done();
+    });
+}
+
+test('settings are clamped when they are saved', async () => {
+    const { m } = make();
+    await m.putMixinSetting('hold', 5000);
+    await m.putMixinSetting('sensitivity', 1);
+    await m.putMixinSetting('duration', 'x');
+    assert.deepEqual([m.storage.getItem('hold'), m.storage.getItem('sensitivity'), m.storage.getItem('duration')], ['600', '6', '1']);
+    await m.release();
 });

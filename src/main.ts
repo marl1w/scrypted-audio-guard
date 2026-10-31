@@ -1,6 +1,7 @@
 import sdk, { MixinProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue, WritableDeviceState } from '@scrypted/sdk';
 
-import { AudioGuardMixin, COMMON_MODE_MS, MixinHost } from './mixin';
+import { Hearing } from './background';
+import { AudioGuardMixin, MixinHost } from './mixin';
 import { ProcRing, renderOverview, renderPerformance, Totals } from './overview';
 import { realTimers } from './runner';
 
@@ -10,10 +11,6 @@ const MARKER = 'scrypted-audio-guard:mixin';
 const FFMPEG_PATH_TIMEOUT_MS = 10_000;
 /** the plugin process is sampled (CPU, memory, throughput) once a minute; the page renders from the ring */
 export const PERF_SAMPLE_MS = 60_000;
-/** the share of listening cameras that, hearing a sound at the same moment (within COMMON_MODE_MS), makes it background */
-export const COMMON_MODE_SHARE = 0.6;
-/** below this many listening cameras the check is off (one camera alone is always 100 %) */
-export const COMMON_MODE_MIN_CAMERAS = 3;
 
 export class AudioGuardProvider extends ScryptedDeviceBase implements MixinProvider, MixinHost, Settings {
     // Enabling is opt-in: nothing here calls setMixins, so the user turns the extension on per camera.
@@ -49,13 +46,9 @@ export class AudioGuardProvider extends ScryptedDeviceBase implements MixinProvi
         return [...this.live.values()];
     }
 
-    /** Most listening cameras had a sound within COMMON_MODE_MS of `at`: the reason, else undefined. */
-    commonMode(at: number): string | undefined {
-        const listening = this.cameras().filter(m => m.runner.state === 'running' && !m.detector.learning);
-        if (listening.length < COMMON_MODE_MIN_CAMERAS)
-            return;
-        const heard = listening.filter(m => m.detector.lastSpikeAt !== undefined && Math.abs(m.detector.lastSpikeAt - at) <= COMMON_MODE_MS).length;
-        return heard >= Math.ceil(COMMON_MODE_SHARE * listening.length) ? `${heard} of ${listening.length} cameras heard it at the same moment` : undefined;
+    /** The background check: what the other listening cameras (running, past learning) heard last. */
+    otherListeners(self: AudioGuardMixin): Hearing[] {
+        return this.cameras().filter(m => m !== self && m.runner.state === 'running' && !m.detector.learning).map(m => m.detector);
     }
 
     totalsNow(): Totals {

@@ -57,7 +57,8 @@ export const WATCHDOG_MS = 30_000;
 export type RunnerState = 'stopped' | 'starting' | 'running' | 'restarting' | 'no audio';
 
 export interface RunnerEvents {
-    onDetected(on: boolean): void;
+    /** the detector's state changed; `forced` when the audio stopped (stopped, ended, no audio), not by the hold */
+    onDetected(on: boolean, forced?: boolean): void;
     /** every window, after the detector (the status history): must be O(1) */
     onLevel?(w: WindowLevel, r: PushResult, now: number): void;
     log(msg: string): void;
@@ -144,7 +145,7 @@ export class AudioRunner {
         this.state = 'stopped';
         this.nextStartAt = undefined;
         if (this.detector.clear())
-            this.ev.onDetected(false);
+            this.ev.onDetected(false, true);
     }
 
     /** settings changed (hold): re-check the hold timer. */
@@ -255,7 +256,7 @@ export class AudioRunner {
         if (!this.wanted)
             return;
         if (this.detector.clear())
-            this.ev.onDetected(false);
+            this.ev.onDetected(false, true);
         if (err && err.startsWith(NO_AUDIO_TRACK)) {
             this.enterNoAudio(NO_AUDIO_TRACK);
             return;
@@ -281,7 +282,7 @@ export class AudioRunner {
     private enterNoAudio(reason: string) {
         this.kill();
         if (this.detector.clear())
-            this.ev.onDetected(false);
+            this.ev.onDetected(false, true);
         const first = !this.noAudio;
         this.noAudio = reason;
         const delay = Math.round(noAudioDelayMs(this.noAudioCount++) * this.noAudioJitter);

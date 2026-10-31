@@ -2,10 +2,11 @@ import sdk, { AudioSensor, EventListenerRegister, ScryptedInterface, Setting, Se
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/sdk/settings-mixin';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 
+import { BACKGROUND_CHECK, backgroundCheckOn, backgroundReason, Hearing } from './background';
 import { AudioDetector, DEFAULT_DETECTOR, DEFAULT_DURATION_S, DEFAULT_HOLD_S, DEFAULT_IMPULSE_DB, DEFAULT_IMPULSE_LEVEL_DB, DEFAULT_MIN_LEVEL_DB, DEFAULT_SENSITIVITY_DB } from './detector';
 import { candidates, FallbackStarter } from './fallback';
 import { OverviewCamera } from './overview';
-import { MIN_DB } from './pcm';
+import { MIN_DB, WINDOW_MS } from './pcm';
 import { AudioRunner, AudioStarter, realTimers, Timers } from './runner';
 import { startAudio, STREAM_RESOLVE_MS } from './source';
 import { ActivityRing, C, MinuteCounter, relTime, renderStatus } from './status';
@@ -16,13 +17,21 @@ export const HOLD_RANGE: [number, number] = [1, 600];
 export const LEVEL_RANGE: [number, number] = [-90, 0];
 export const DURATION_RANGE: [number, number] = [0.2, 10];
 export const IMPULSE_RANGE: [number, number] = [6, 60];
-/** a sound is checked against the other cameras this long after it starts (their sounds of the same moment are in by then) */
-export const COMMON_MODE_MS = 1000;
 
 function clamp(v: unknown, [lo, hi]: [number, number], dflt: number): number {
     const n = Number(v);
     return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
 }
+
+/** the numeric settings: range and default, clamped when read and when saved */
+const NUMBERS: Record<string, [[number, number], number]> = {
+    sensitivity: [SENSITIVITY_RANGE, DEFAULT_SENSITIVITY_DB],
+    minLevel: [LEVEL_RANGE, DEFAULT_MIN_LEVEL_DB],
+    duration: [DURATION_RANGE, DEFAULT_DURATION_S],
+    impulse: [IMPULSE_RANGE, DEFAULT_IMPULSE_DB],
+    impulseLevel: [LEVEL_RANGE, DEFAULT_IMPULSE_LEVEL_DB],
+    hold: [HOLD_RANGE, DEFAULT_HOLD_S],
+};
 
 export interface MixinHost {
     ffmpegPath(): Promise<string>;
@@ -32,8 +41,8 @@ export interface MixinHost {
     timers?: Timers;
     /** plugin-wide counters: 100 ms windows of all cameras (the provider's throughput figure) */
     totals?: { windows: number };
-    /** a sound at `at` (monotonic ms) was heard by most listening cameras at once: background, not near one camera */
-    commonMode?(at: number): string | undefined;
+    /** the background check: what the other listening cameras heard last (none without the provider) */
+    otherListeners?(self: AudioGuardMixin): Hearing[];
 }
 
 export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implements AudioSensor {
@@ -82,7 +91,7 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         },
         hold: {
             title: 'Hold (s)',
-            description: 'How long the sensor stays on after the last loud sound.',
+            description: 'How long the sensor stays on after the last loud sound, counted from when it turned on (with 3 or more cameras listening, a sound is published 1 s late by the background check).',
             type: 'number',
             defaultValue: DEFAULT_HOLD_S,
             onPut: () => this.configure(),
@@ -97,8 +106,16 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
     /** sounds (audioDetected turned on) per minute over the last hour (plugin overview) */
     readonly detections = new MinuteCounter();
     private released = false;
-    /** a new sound waits COMMON_MODE_MS for the other cameras before it is published */
+    /** the background check of a new sound: it waits BACKGROUND_CHECK.delayMs for the other cameras before it is published */
     private pending: unknown;
+    /** after the detector's hold, the sensor stays on until Hold after it turned on */
+    private offTimer: unknown;
+    /** when audioDetected turned on (monotonic ms) */
+    private onSince = 0;
+    /** the sound going on was found to be background: not published, and not checked again until it ends */
+    background = false;
+    /** rate limit of the "sound ignored" log */
+    private ignoredLog = { at: -Infinity, more: 0 };
     private listeners: EventListenerRegister[] = [];
 
     constructor(options: SettingsMixinDeviceOptions<VideoCamera>, private host: MixinHost) {
@@ -114,8 +131,8 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         );
         const starter: AudioStarter = host.starter?.(this) ?? this.fallback.start;
         this.runner = new AudioRunner(starter, this.detector, {
-            onDetected: on => this.publish(on),
-            onLevel: (w, r, now) => this.record(w.sustainedDb, r.spike, r.detected, now),
+            onDetected: (on, forced) => this.publish(on, forced),
+            onLevel: (w, r, now) => this.record(w.sustainedDb, r.spike, now),
             log: m => this.console.log(m),
             warn: m => this.console.warn(maskUrls(m)),
         }, host.timers ?? realTimers);
@@ -132,14 +149,20 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         this.sync();
     }
 
+    /** a numeric setting, clamped to its range */
+    private num(key: string): number {
+        const [range, dflt] = NUMBERS[key];
+        return clamp((this.storageSettings.values as any)[key], range, dflt);
+    }
+
     private tuning() {
         return {
-            sensitivityDb: clamp(this.storageSettings.values.sensitivity, SENSITIVITY_RANGE, DEFAULT_SENSITIVITY_DB),
-            holdMs: clamp(this.storageSettings.values.hold, HOLD_RANGE, DEFAULT_HOLD_S) * 1000,
-            absMinDb: clamp(this.storageSettings.values.minLevel, LEVEL_RANGE, DEFAULT_MIN_LEVEL_DB),
-            minSustainedWindows: Math.round(clamp(this.storageSettings.values.duration, DURATION_RANGE, DEFAULT_DURATION_S) * 10),
-            impulseDb: clamp(this.storageSettings.values.impulse, IMPULSE_RANGE, DEFAULT_IMPULSE_DB),
-            impulseMinDb: clamp(this.storageSettings.values.impulseLevel, LEVEL_RANGE, DEFAULT_IMPULSE_LEVEL_DB),
+            sensitivityDb: this.num('sensitivity'),
+            holdMs: this.num('hold') * 1000,
+            absMinDb: this.num('minLevel'),
+            minSustainedWindows: Math.round((this.num('duration') * 1000) / WINDOW_MS),
+            impulseDb: this.num('impulse'),
+            impulseMinDb: this.num('impulseLevel'),
         };
     }
 
@@ -154,8 +177,10 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
             return;
         if (this.storageSettings.values.enabled !== false)
             this.runner.start();
-        else
+        else {
             this.runner.stop();
+            this.soundEnded(true);
+        }
     }
 
     streamsChanged() {
@@ -165,54 +190,116 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         this.runner.streamsChanged();
     }
 
-    private publish(on: boolean) {
-        if (this.released)
-            return;
-        const t = this.host.timers ?? realTimers;
-        t.clearTimeout(this.pending);
-        this.pending = undefined;
-        if (!on) {
-            if (this.audioDetected)
-                this.audioDetected = false;
-            return;
-        }
-        if (!this.host.commonMode) {
-            this.show();
-            return;
-        }
-        // wait for the other cameras: a sound most of them hear at the same moment is background (wind, rain, a distant bang)
-        const at = this.detector.lastSpikeAt ?? this.now();
-        this.pending = t.setTimeout(() => {
-            this.pending = undefined;
-            if (this.released || !this.detector.detected)
-                return;
-            const why = this.host.commonMode?.(at);
-            if (!why) {
-                this.show();
-                return;
-            }
-            this.console.log(`sound ignored: ${why}`);
-            // forget it: the next sound of this camera is checked afresh
-            this.detector.clear();
-        }, COMMON_MODE_MS);
+    private get timers(): Timers {
+        return this.host.timers ?? realTimers;
     }
 
-    private show() {
-        this.detections.add(this.now());
+    /** The detector turned on or off: audioDetected follows, after the background check and for at least Hold. */
+    private publish(on: boolean, forced = false) {
+        if (this.released)
+            return;
+        if (on)
+            this.soundStarted();
+        else
+            this.soundEnded(forced);
+    }
+
+    private soundStarted() {
+        this.timers.clearTimeout(this.offTimer);
+        this.offTimer = undefined;
+        if (this.audioDetected || this.pending !== undefined)
+            return;
+        if (!backgroundCheckOn(this.host.otherListeners?.(this).length ?? 0)) {
+            this.turnOn();
+            return;
+        }
+        // wait for the other cameras: a sound most of them hear alike at the same moment is background (wind, rain, a distant bang)
+        const at = this.detector.soundStartAt ?? this.now();
+        this.pending = this.timers.setTimeout(() => this.check(at), BACKGROUND_CHECK.delayMs);
+    }
+
+    private check(at: number) {
+        this.pending = undefined;
+        if (this.released)
+            return;
+        if (this.runner.state !== 'running') {
+            this.console.log('background check: a pending sound was dropped, the audio stopped');
+            return;
+        }
+        const why = backgroundReason(at, this.detector.lastSpikeExcessDb ?? 0, this.host.otherListeners?.(this) ?? []);
+        if (why) {
+            // not cleared: a sound that keeps going is not checked again; it ends with the detector's hold
+            this.background = this.detector.detected;
+            this.logIgnored(why);
+            return;
+        }
+        this.turnOn();
+        if (!this.detector.detected)
+            this.soundEnded(false); // a Hold shorter than the check: on for Hold from now
+    }
+
+    private logIgnored(why: string) {
+        const now = this.now(), l = this.ignoredLog;
+        if (now - l.at < BACKGROUND_CHECK.logEveryMs) {
+            l.more++;
+            return;
+        }
+        this.console.log(`background check: sound ignored, ${why}${l.more ? ` (and ${l.more} more since the last line)` : ''}`);
+        this.ignoredLog = { at: now, more: 0 };
+    }
+
+    private turnOn() {
+        this.onSince = this.now();
+        this.detections.add(this.onSince);
         this.audioDetected = true;
     }
 
+    private soundEnded(forced: boolean) {
+        this.background = false;
+        if (forced) {
+            // the audio stopped (disabled, ended, released): nothing waits
+            if (this.pending !== undefined) {
+                this.timers.clearTimeout(this.pending);
+                this.pending = undefined;
+                this.console.log('background check: a pending sound was dropped, the audio stopped');
+            }
+            this.turnOff();
+            return;
+        }
+        // the check decides (and counts Hold from then)
+        if (this.pending !== undefined || !this.audioDetected)
+            return;
+        const left = this.onSince + this.detector.config.holdMs - this.now();
+        if (left <= 0) {
+            this.turnOff();
+            return;
+        }
+        this.timers.clearTimeout(this.offTimer);
+        this.offTimer = this.timers.setTimeout(() => {
+            this.offTimer = undefined;
+            if (!this.detector.detected)
+                this.turnOff();
+        }, left);
+    }
+
+    private turnOff() {
+        this.timers.clearTimeout(this.offTimer);
+        this.offTimer = undefined;
+        if (this.audioDetected)
+            this.audioDetected = false;
+    }
+
     private now(): number {
-        return (this.host.timers ?? realTimers).now();
+        return this.timers.now();
     }
 
     /** one window into the status history: O(1), no allocation. db is the window's sustained level, the one compared with the threshold. */
-    private record(db: number, spike: boolean, detected: boolean, now: number) {
+    private record(db: number, spike: boolean, now: number) {
         const floor = this.detector.floorDb;
         const c = this.detector.config;
         // the threshold a window's sustained level must reach: floor + sensitivity, never below the absolute minimum
         const threshold = floor === undefined ? undefined : Math.max(floor + c.sensitivityDb, c.absMinDb);
-        this.activity.add(now, db, floor, threshold, spike, detected);
+        this.activity.add(now, db, floor, threshold, spike, !!this.audioDetected, this.background);
         if (this.host.totals)
             this.host.totals.windows++;
     }
@@ -230,8 +317,10 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
             return { state: 'Starting', color: C.blue };
         if (d.learning)
             return { state: 'Learning', color: C.blue };
-        if (d.detected)
+        if (this.audioDetected)
             return { state: 'Sound', color: C.red };
+        if (this.background)
+            return { state: 'Background', color: C.gray };
         return r.silent ? { state: 'Silent', color: C.gray } : { state: 'Listening', color: C.green };
     }
 
@@ -267,7 +356,7 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         else if (d.learning)
             state = 'Learning the background';
         else
-            state = d.detected ? 'Sound detected' : r.silent ? 'Listening (the audio is digital silence)' : 'Listening';
+            state = this.audioDetected ? 'Sound detected' : this.background ? 'Background (ignored by the background check)' : r.silent ? 'Listening (the audio is digital silence)' : 'Listening';
         if (this.fallback.current && this.fallback.current !== 'low-resolution' && (r.state === 'running' || r.state === 'starting'))
             state += ` on ${this.fallback.current}`;
         const parts = [state];
@@ -282,7 +371,10 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
     statusHtml(now = this.now()): string {
         const r = this.runner;
         const empty = r.state === 'stopped' ? 'Disabled, no data' : r.noAudio ? 'No audio, no data' : 'Listening, no data yet';
-        return renderStatus(this.statusText(now), this.activity, now, empty);
+        const c = this.detector.config, floor = this.detector.floorDb;
+        const loud = floor === undefined ? '' : ` (now ${Math.max(floor + c.impulseDb, c.impulseMinDb).toFixed(0)} dBFS)`;
+        const note = `Not drawn: a short loud sound counts when one 100 ms window reaches the floor + ${c.impulseDb} dB and ${c.impulseMinDb} dBFS${loud}.`;
+        return renderStatus(this.statusText(now), this.activity, now, empty, note);
     }
 
     async getMixinSettings(): Promise<Setting[]> {
@@ -301,6 +393,8 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
     async putMixinSetting(key: string, value: SettingValue): Promise<boolean | void> {
         if (key === 'status')
             return true;
+        if (NUMBERS[key])
+            value = clamp(value, NUMBERS[key][0], this.num(key));
         await this.storageSettings.putSetting(key, value);
         sdk.deviceManager.onMixinEvent(this.id, this, ScryptedInterface.Settings, null);
         return true;
@@ -311,9 +405,7 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
             return;
         // stop first: the runner publishes the sensor off while publishing is still allowed
         this.runner.stop();
-        (this.host.timers ?? realTimers).clearTimeout(this.pending);
-        if (this.audioDetected)
-            this.audioDetected = false;
+        this.soundEnded(true);
         this.released = true;
         for (const l of this.listeners.splice(0))
             try { l.removeListener(); } catch { /* gone */ }

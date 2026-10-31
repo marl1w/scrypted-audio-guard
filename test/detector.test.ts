@@ -48,7 +48,7 @@ test('a sustained moderate sound (1.5 s at -40 dBFS, voices) counts after 1 s; 0
     const pcm = overlay(overlay(noise(-60, 60_000, rng(31)), noise(-40, 1500, rng(32)), 30_000), noise(-40, 500, rng(33)), 50_000);
     const r = feed(d, windows(pcm));
     assert.deepEqual(r.on, [30_900], 'on at the 10th window');
-    assert.equal(r.res.find(x => x.changed && x.detected)?.impulse, false);
+    assert.equal(d.soundStartAt, 30_000, 'the sound starts at its first loud window, not when it qualified');
 });
 
 test('speech with short pauses (0.2 s) counts as one sustained sound; longer pauses restart it', () => {
@@ -224,4 +224,33 @@ test('wind: gusts swelling 8 dB over a few seconds above a windy background neve
     // -55 dBFS, a gust every 7 s up to -47 dBFS
     const r = feed(d, windows(noise(i => -55 + 8 * Math.max(0, Math.sin((2 * Math.PI * i) / (7 * 8000))), n / 8, rng(46))));
     assert.deepEqual(r.on, []);
+});
+
+test('a sustained sound needs 60 % of Minimum duration as loud windows: loud-quiet-quiet for 1.2 s does not count', () => {
+    const d = new AudioDetector();
+    let now = 0;
+    const push = (db: number, n = 1) => { let r; for (let i = 0; i < n; i++) r = d.push({ db, sustainedDb: db }, now += 100); return r!; };
+    push(-60, 150);
+    for (let i = 0; i < 4; i++) {
+        push(-40); // loud: 20 dB over the floor, above -45 dBFS, no impulse
+        push(-60, 2); // gaps of 0.2 s keep the sound going
+    }
+    assert.equal(d.detected, false, '12 windows, only 4 loud (60 % of 10 is 6)');
+    push(-60, 20);
+    const onAt = now;
+    push(-40, 6);
+    assert.equal(d.detected, false);
+    push(-60, 2);
+    push(-40, 2);
+    assert.equal(d.detected, true, '10 windows, 8 loud');
+    assert.equal(d.soundStartAt, onAt + 100);
+});
+
+test('a loud steady sound (an idling engine at -25 dBFS for 2 min) is not rebuilt into the floor', () => {
+    const d = new AudioDetector();
+    feed(d, windows(noise(-65, 60_000, rng(51))));
+    const r = feed(d, windows(noise(-25, 120_000, rng(52))), 60_000);
+    assert.equal(r.res.filter(x => x.rebaselined).length, 0);
+    assert.equal(d.detected, true);
+    assert.ok(Math.abs(d.floorDb! - -65) < 1.5, `floor ${d.floorDb}`);
 });

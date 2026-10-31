@@ -10,7 +10,7 @@ export const AXIS_MAX_DB = 0;
 /** smallest dB span of the axis */
 const MIN_SPAN_DB = 20;
 
-const SPIKE = 1, PUBLISHED = 2;
+const SPIKE = 1, PUBLISHED = 2, BACKGROUND = 4;
 
 export const C = { green: '#2f9e5b', amber: '#d9930d', red: '#e5484d', blue: '#3b82f6', gray: '#8b8b8b' };
 
@@ -29,6 +29,8 @@ export interface Bucket {
     spike: boolean;
     /** audioDetected was on */
     published: boolean;
+    /** a sound went on that the background check ignored */
+    background: boolean;
 }
 
 /** Ring of ACTIVITY_S one-second buckets. A bucket is valid only while its stamp is its own second: no clearing pass on rollover. */
@@ -40,7 +42,7 @@ export class ActivityRing {
     private flags = new Uint8Array(ACTIVITY_S);
 
     /** One 100 ms window: O(1), no allocation. floor/threshold undefined while learning. */
-    add(nowMs: number, db: number, floor: number | undefined, threshold: number | undefined, spike: boolean, published: boolean) {
+    add(nowMs: number, db: number, floor: number | undefined, threshold: number | undefined, spike: boolean, published: boolean, background = false) {
         const s = Math.floor(nowMs / 1000);
         const i = s % ACTIVITY_S;
         if (this.sec[i] !== s) {
@@ -52,7 +54,7 @@ export class ActivityRing {
             this.level[i] = db;
         this.floor[i] = floor ?? NaN;
         this.threshold[i] = threshold ?? NaN;
-        this.flags[i] |= (spike ? SPIKE : 0) | (published ? PUBLISHED : 0);
+        this.flags[i] |= (spike ? SPIKE : 0) | (published ? PUBLISHED : 0) | (background ? BACKGROUND : 0);
     }
 
     /** The bucket `ageS` seconds before the current one (0 = the current second); undefined = no audio in that second (a gap). */
@@ -65,7 +67,7 @@ export class ActivityRing {
         const i = s % ACTIVITY_S;
         if (this.sec[i] !== s)
             return undefined;
-        return { level: this.level[i], floor: this.floor[i], threshold: this.threshold[i], spike: !!(this.flags[i] & SPIKE), published: !!(this.flags[i] & PUBLISHED) };
+        return { level: this.level[i], floor: this.floor[i], threshold: this.threshold[i], spike: !!(this.flags[i] & SPIKE), published: !!(this.flags[i] & PUBLISHED), background: !!(this.flags[i] & BACKGROUND) };
     }
 
     /** the last 10 min, oldest first (allocates: render only) */
@@ -138,15 +140,18 @@ function runs(n: number, on: (k: number) => boolean): [number, number][] {
 
 /**
  * 'Activity' block over the last 10 min: level (per-second max of the windows' sustained level, what the detector decides on),
- * floor (faint, dashed) and threshold (solid amber) in dBFS, sound bands and the Sensor on lane. Seconds without audio break the
- * lines. `emptyText` without data. Fixed min-width in a scrolling wrapper: the labels stay readable on a phone.
+ * floor (faint, dashed) and threshold (solid amber) in dBFS, sound bands and the Sensor on lane (green: audioDetected
+ * on; grey: a sound the background check ignored). Seconds without audio break the lines. `emptyText` without data, `note` under
+ * the legend. Fixed min-width in a scrolling wrapper: the labels stay readable on a phone.
  */
-export function renderActivity(ring: ActivityRing, nowMs: number, emptyText = 'Listening, no data yet'): string {
+export function renderActivity(ring: ActivityRing, nowMs: number, emptyText = 'Listening, no data yet', note?: string): string {
     const b = ring.series(nowMs);
     const legend = `${lineSample(C.blue, 1.2)} level &nbsp;${lineSample('currentColor', 1.2, FLOOR_DASH, FLOOR_OPACITY)} floor &nbsp;${lineSample(C.amber, 1.5)} threshold &nbsp;`
         + `<span style="display:inline-block;width:10px;height:10px;vertical-align:middle;background:${C.red};opacity:${SOUND_OPACITY * 2}"></span> sound &nbsp;`
-        + `<span style="display:inline-block;width:14px;height:7px;vertical-align:middle;background:${C.green}"></span> sensor on`;
-    const head = `<div style="margin-top:10px"><div style="font-weight:600">Activity</div><div style="opacity:.7;font-size:85%">${legend}</div>`;
+        + `<span style="display:inline-block;width:14px;height:7px;vertical-align:middle;background:${C.green}"></span> sensor on &nbsp;`
+        + `<span style="display:inline-block;width:14px;height:7px;vertical-align:middle;background:${C.gray}"></span> background`;
+    const head = `<div style="margin-top:10px"><div style="font-weight:600">Activity</div><div style="opacity:.7;font-size:85%">${legend}</div>`
+        + (note ? `<div style="opacity:.7;font-size:85%">${esc(note)}</div>` : '');
     if (!b.some(Boolean))
         return head + `<div style="opacity:.7;margin-top:4px">${esc(emptyText)}</div></div>`;
 
@@ -176,6 +181,7 @@ export function renderActivity(ring: ActivityRing, nowMs: number, emptyText = 'L
     const ly = base + 6;
     const lane = `<text x="${x0 - 4}" y="${ly + 7}" font-size="${FS}" fill="currentColor" text-anchor="end" opacity=".7">Sensor on</text>`
         + `<rect x="${x0}" y="${ly}" width="${x1 - x0}" height="8" fill="currentColor" fill-opacity=".08"/>`
+        + runs(ACTIVITY_S, k => !!b[k]?.background && !b[k]?.published).map(([a, e]) => `<rect x="${xs(a)}" y="${ly}" width="${width(a, e)}" height="8" fill="${C.gray}"><title>${esc(`background, ${e - a} s`)}</title></rect>`).join('')
         + runs(ACTIVITY_S, k => !!b[k]?.published).map(([a, e]) => `<rect x="${xs(a)}" y="${ly}" width="${width(a, e)}" height="8" fill="${C.green}"/>`).join('');
     const t = (tx: number, ty: number, s: string, a = 'start') => `<text x="${tx}" y="${ty}" font-size="${FS}" fill="currentColor" text-anchor="${a}" opacity=".7">${esc(s)}</text>`;
     return head
@@ -208,9 +214,9 @@ export function relTime(thenMs: number | undefined, nowMs: number): string {
 }
 
 /** The camera's Status setting: the status line, then the Activity chart. */
-export function renderStatus(statusLine: string, ring: ActivityRing, nowMs: number, emptyText?: string): string {
+export function renderStatus(statusLine: string, ring: ActivityRing, nowMs: number, emptyText?: string, note?: string): string {
     return `<div style="font-size:90%;line-height:1.45;max-width:680px;color:currentColor">`
         + `<div>${esc(statusLine)}</div>`
-        + renderActivity(ring, nowMs, emptyText)
+        + renderActivity(ring, nowMs, emptyText, note)
         + `</div>`;
 }
