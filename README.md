@@ -1,10 +1,10 @@
 # Audio Guard
 
-A Scrypted plugin that listens to each camera's audio and turns it into the standard Scrypted **AudioSensor** (`audioDetected`). It turns on when a sound rises clearly above that camera's own background. Silence and steady noise (wind, a fan, traffic hum) keep it off.
+A Scrypted plugin that listens to each camera's audio and turns it into the standard Scrypted **AudioSensor** (`audioDetected`). It turns on for a sound near the camera: a loud short one (a bang, a door, breaking glass) or a sustained one (voices, footsteps). The camera's own faint noise, silence and steady or slowly changing noise (wind, rain, insects, traffic hum) keep it off.
 
 ## What you get
 
-- A sound sensor per camera, learned from the camera's own background: there is no absolute threshold to tune per room.
+- A sound sensor per camera, relative to the camera's own learned background, with absolute minimum levels that keep the camera's own noise out.
 - It works everywhere Scrypted devices go. A camera-device integration such as scrypted-mqtt-ha (and so Home Assistant) can show it as a `binary_sensor` with device class `sound`. An event detector such as scrypted-stamina can use it as an event trigger.
 - It is cheap: one small audio-only ffmpeg per enabled camera. No video is decoded, and on Rebroadcast's RTSP stream the video is not even sent (see [CPU](#cpu)).
 - It is honest about cameras without audio. A camera whose streams have no audio track shows "No audio" and is checked again later, less and less often. A camera that sends digital silence (audio gated or turned off) shows that on its Status line, but is still listened to.
@@ -20,10 +20,15 @@ If the low-resolution stream has no audio track, the plugin tries the `local` an
 The plugin cuts the PCM into 100 ms windows and computes each window's RMS level in dBFS:
 
 - **Noise floor:** the 20th percentile of the window levels over the last 5 minutes. Windows that are currently loud are left out, so a long sound does not raise the floor. The floor is learned in the first 10 s after a start; nothing is detected until then.
-- **Spike:** at least two consecutive windows (200 ms) at **floor + Sensitivity** or more, and at or above an absolute minimum of −50 dBFS. A near-silent room plus a little noise therefore never triggers. A window counts only if both of its 50 ms halves are loud, so a click or a short tap, even one on a window boundary, is not a spike.
+- **A sound** counts through one of two tiers:
+  - **Loud sound (impulse):** a single window at **Loud sound above the background** (default +25 dB) over the floor or more, and at or above **Loud sound level** (default −30 dBFS). A bang, a door slam or breaking glass counts at once, however short.
+  - **Sustained sound:** windows at **floor + Sensitivity** or more and at or above **Minimum level** (default −45 dBFS), for **Minimum duration** (default 1 s). Pauses of up to 0.2 s (between words or steps) do not break it. Here a window counts only if both of its 50 ms halves are loud, so a click does not.
+
+  The camera's own noise (IR-cut clicks, codec glitches, electronics) is faint and short, so it passes neither tier. Measured on outdoor Reolink cameras at night, these defaults turn about 60 false sounds per hour on a quiet camera into none (see [Defaults](#defaults)).
+- **Background heard everywhere:** with three or more cameras listening, a new sound waits 1 s before it is published. If at least 60 % of the listening cameras had a sound within 1 s of it, it is background (a gust of wind, rain, a distant bang or fireworks) and it is not published; the camera's console logs "sound ignored". With fewer than three cameras there is no check and no delay.
 - **Hold:** the sensor stays on for **Hold** seconds after the last spike window.
 - **A louder background that stays:** if the background itself steps up (rain starts, a fan turns on), the loud windows would never enter the floor. From the first loud window, the plugin records every window, quiet gaps included, until 1 s of quiet ends the run. When the last 60 s of the run are steady (at most 6 dB between their 25th and 75th percentiles), the floor is rebuilt from them, and the sensor goes off one Hold later. Speech, music or barking are not steady and never become the floor.
-- **Digital silence:** audio at or below −90 dBFS for 60 s shows "the audio is digital silence" on the Status line, and nothing else changes. Gated or noise-suppressed cameras send exact zeros in a quiet room, so ffmpeg keeps running and a sound is still detected. The note clears after about 2 s of audio at or above −50 dBFS.
+- **Digital silence:** audio at or below −90 dBFS for 60 s shows "the audio is digital silence" on the Status line, and nothing else changes. Gated or noise-suppressed cameras send exact zeros in a quiet room, so ffmpeg keeps running and a sound is still detected. The note clears after about 2 s of audio at or above the Minimum level.
 - **No audio track:** if no stream has an audio track, the camera is marked "No audio". Its ffmpeg stops and the plugin checks again after 5 min, then 10, 20 and 40 min, and every hour after that. Each camera has its own fixed ±20 % factor on these delays. The first audio received clears "No audio". When the camera's settings or streams change (Rebroadcast, the camera plugin), a camera marked "No audio" is checked again within 2 s, its backoff starts over, and the stream search starts again from the low-resolution stream.
 - **Resilience:** if ffmpeg ends or fails to start, it restarts after 1 s, doubling the wait up to 60 s, each delay jittered by ±20 %. After a run of 60 s or more, the next failure starts again from 1 s. A stream that delivers no audio for 30 s is killed and restarted. A process that ends while the sensor is on turns it off, and so does disabling or removing the extension.
 - **Spread starts:** each camera's first start waits a random 0 to 3 s, so loading the plugin does not start every ffmpeg at the same moment.
@@ -43,12 +48,32 @@ The plugin cuts the PCM into 100 ms windows and computes each window's RMS level
 ## Settings (per camera)
 
 - **Status** (read-only): the state (Listening, Listening with the audio as digital silence, Learning the background, Sound detected, Reconnecting, No audio, Disabled), the stream used when it is not the low-resolution one, the current level, the floor and the time of the last sound. It refreshes when the page is opened.
-  Below it, the **Activity** chart shows the last 10 minutes, one point per second: the sound level (the loudest sustained level of the second's 100 ms windows, the value the detector compares, in dBFS), the noise floor (faint, dashed), the threshold (amber: floor plus Sensitivity, never below −50 dBFS), the seconds with a detected sound (red), and a **Sensor on** bar for when `audioDetected` was on. The lines break where there was no audio (no audio track, ffmpeg down or restarting). The dBFS axis follows the data between −90 and 0. The history is kept in memory (about 13 KB per camera) and lost on a plugin restart.
+  Below it, the **Activity** chart shows the last 10 minutes, one point per second: the sound level (the loudest sustained level of the second's 100 ms windows, the value the detector compares, in dBFS), the noise floor (faint, dashed), the sustained-sound threshold (amber: floor plus Sensitivity, never below the Minimum level), the seconds with a detected sound (red), and a **Sensor on** bar for when `audioDetected` was on. The lines break where there was no audio (no audio track, ffmpeg down or restarting). The dBFS axis follows the data between −90 and 0. The history is kept in memory (about 13 KB per camera) and lost on a plugin restart.
 - **Enabled** (on by default): off stops the camera's audio process; the sensor stays off.
-- **Sensitivity (dB)** (default 15, 6 to 40): how far above the background a sound must be. A lower value is more sensitive.
+- **Sensitivity (dB)** (default 15, 6 to 40): how far above the background a sustained sound must be. A lower value is more sensitive.
+- **Minimum level (dBFS)** (default −45, −90 to 0): a sustained sound must also be at least this loud.
+- **Minimum duration (s)** (default 1, 0.2 to 10): how long a sustained sound must last.
+- **Loud sound above the background (dB)** (default 25, 6 to 60) and **Loud sound level (dBFS)** (default −30, −90 to 0): a short sound counts at once when it is at least this far above the background and at least this loud.
 - **Hold (s)** (default 10, 1 to 600): how long the sensor stays on after the last loud sound.
 
-The other values are fixed on purpose: windows of 100 ms, at least 2 windows, an absolute minimum of −50 dBFS, the 20th percentile over 5 min, 10 s of learning, silence at −90 dBFS for 60 s, a steady background within 6 dB.
+The other values are fixed on purpose: windows of 100 ms, pauses of up to 0.2 s inside a sustained sound, the 20th percentile over 5 min, 10 s of learning, silence at −90 dBFS for 60 s, a steady background within 6 dB, and the background check (60 % of at least 3 listening cameras within 1 s).
+
+### Defaults
+
+The defaults come from outdoor cameras on a quiet night, measured per 100 ms window (3 minutes on each of six cameras):
+
+| | Quiet cameras (4) | Normal cameras (2) |
+|---|---|---|
+| Noise floor | −68 to −73 dBFS | −61 and −50 dBFS |
+| Faint blips (camera self-noise, far sounds) | 50 to 80 per 3 min, mostly 0.1 to 0.3 s at −50 to −60 dBFS | |
+| Loudest short sound on a quiet camera | −31 dBFS for 0.6 s (one) | |
+| Real nearby sounds | −36 to −24 dBFS for 1 to 24 s | −23 to −28 dBFS bangs, −34 dBFS for 1 to 3 s |
+| Sounds with the old rule (floor + 15 dB, −50 dBFS, 0.2 s) | 14 in 11 min (about 75 per hour) | 4 in 6 min |
+| Sounds with the defaults | 2 (both real, on one camera) | 3 (real) |
+
+The −45 dBFS minimum level sits above the self-noise and 1 s is longer than any of its blips; a −30 dBFS loud level is just above the loudest short sound a quiet camera picked up from afar.
+
+- **Wind and rain:** steady rain, or a wind that stays, is learned into the floor (a lasting step is rebuilt into the floor after 60 s steady). Its onset can count once. Gusts that swell over seconds rise less than 15 dB over the floor and rarely reach −45 dBFS, so they do not count. A gust strong enough to pass is usually heard by most cameras at once and is dropped by the background check. Strong gusts right on one microphone can still count: raise Minimum level or Sensitivity on that camera.
 
 ## Plugin page
 
@@ -75,8 +100,8 @@ A 20 s capture of a camera's RTMP substream (640 px video, AAC audio) through Re
 - **"No audio (no audio track)":** the stream has no audio. Enable the microphone or audio recording on the camera or NVR. The plugin checks again as soon as the camera's settings or streams change, otherwise at the next scheduled check.
 - **"Listening (the audio is digital silence)":** the stream carries only zeros. In a quiet room this is normal for cameras that gate or suppress noise, and sounds are still detected. If it never clears, audio is probably turned off in the camera or NVR settings.
 - **"… on stream …" in the Status:** the low-resolution stream has no audio and another stream is used. Enabling audio on the substream lets the plugin use the prebuffered one.
-- **Too many detections:** raise Sensitivity (for example to 20 dB). Check the floor and level on the Status line.
-- **Missed sounds:** lower Sensitivity. A sound must also be louder than −50 dBFS at the camera, and last at least 200 to 300 ms.
+- **Too many detections:** check the floor and level on the Status line and the Activity chart. For sustained sounds raise Minimum level or Sensitivity (for example to 20 dB) or Minimum duration; for short ones raise Loud sound level.
+- **Missed sounds:** a short sound must reach Loud sound level (−30 dBFS) at the camera; a quieter one must last Minimum duration (1 s) above Minimum level (−45 dBFS). Lower these for a camera far from where things happen. A sound most cameras hear at once is treated as background.
 - **"Reconnecting":** the camera console shows why ffmpeg ended (stream URLs are masked).
 
 ## Development

@@ -141,7 +141,7 @@ test('detection: on after a burst, off by the hold timer even when no more windo
     const s = setup();
     await s.boot();
     s.feed(-60, 150);
-    s.feed(-35, 3);
+    s.feed(-25, 3);
     assert.deepEqual(s.events, [true]);
     s.clock.advance(9_000);
     assert.deepEqual(s.events, [true]);
@@ -154,7 +154,7 @@ test('a process ending while detected turns the sensor off', async () => {
     const s = setup();
     await s.boot();
     s.feed(-60, 150);
-    s.feed(-35, 3);
+    s.feed(-25, 3);
     s.procs[0].end('ffmpeg exited (code 1)'); await flush();
     assert.deepEqual(s.events, [true, false]);
     s.runner.stop();
@@ -247,7 +247,7 @@ test('stop: process killed, timers cleared, sensor off, late windows and exits i
     const s = setup();
     await s.boot();
     s.feed(-60, 150);
-    s.feed(-35, 3);
+    s.feed(-25, 3);
     const p = s.procs[0];
     s.runner.stop();
     assert.equal(p.stopped, true);

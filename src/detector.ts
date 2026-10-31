@@ -2,8 +2,12 @@
 //
 // - Noise floor: the 20th percentile of the window levels of the last 5 minutes (3000 windows), windows currently above
 //   the threshold left out. A histogram of 0.5 dB bins keeps the percentile O(bins) per window.
-// - Spike: a window whose sustained level (its quieter 50 ms half) is at least floor + sensitivity and at least the
-//   absolute minimum, for minSpikeWindows consecutive windows (200 ms). A lone click never spans two windows' halves.
+// - A sound counts through one of two tiers:
+//   - Loud impulse: one window (100 ms) whose level is at least floor + impulseDb and at least impulseMinDb. A bang, a
+//     door slam or breaking glass counts at once, however short.
+//   - Sustained: windows whose sustained level (their quieter 50 ms half) is at least floor + sensitivity and at least
+//     absMinDb, for minSustainedWindows (1 s). Gaps of up to gapWindows quiet windows (between syllables or steps) do
+//     not break it. A faint click or a short glitch of the camera never lasts that long.
 // - Hold: detected stays on until holdMs after the last spike window.
 // - Step change: when the background itself jumps (a fan, rain) the loud windows stay out of the floor. A "run" starts
 //   at the first loud window and records EVERY window from then on (quiet gaps included) until runGapWindows quiet
@@ -21,10 +25,16 @@ export interface DetectorConfig {
     sensitivityDb: number;
     /** how long detected stays on after the last spike. */
     holdMs: number;
-    /** a spike must also be at least this loud (dBFS): a near-silent floor plus small noise never triggers. */
+    /** a sustained sound must also be at least this loud (dBFS): a near-silent floor plus small noise never triggers. */
     absMinDb: number;
-    /** consecutive spike windows needed (x 100 ms). */
-    minSpikeWindows: number;
+    /** windows a sustained sound must last (x 100 ms), its short gaps included. */
+    minSustainedWindows: number;
+    /** quiet windows in a row that a sustained sound may contain without ending. */
+    gapWindows: number;
+    /** dB above the noise floor that makes one window a loud impulse. */
+    impulseDb: number;
+    /** a loud impulse must also be at least this loud (dBFS). */
+    impulseMinDb: number;
     /** percentile of the floor history (0..1). */
     floorPercentile: number;
     /** windows in the floor history (5 min). */
@@ -47,12 +57,19 @@ export interface DetectorConfig {
 
 export const DEFAULT_SENSITIVITY_DB = 15;
 export const DEFAULT_HOLD_S = 10;
+export const DEFAULT_MIN_LEVEL_DB = -45;
+export const DEFAULT_DURATION_S = 1;
+export const DEFAULT_IMPULSE_DB = 25;
+export const DEFAULT_IMPULSE_LEVEL_DB = -30;
 
 export const DEFAULT_DETECTOR: DetectorConfig = {
     sensitivityDb: DEFAULT_SENSITIVITY_DB,
     holdMs: DEFAULT_HOLD_S * 1000,
-    absMinDb: -50,
-    minSpikeWindows: 2,
+    absMinDb: DEFAULT_MIN_LEVEL_DB,
+    minSustainedWindows: (DEFAULT_DURATION_S * 1000) / WINDOW_MS,
+    gapWindows: 2,
+    impulseDb: DEFAULT_IMPULSE_DB,
+    impulseMinDb: DEFAULT_IMPULSE_LEVEL_DB,
     floorPercentile: 0.2,
     floorWindows: (5 * 60_000) / WINDOW_MS,
     learnWindows: 10_000 / WINDOW_MS,
@@ -81,6 +98,8 @@ export interface PushResult {
     rebaselined: boolean;
     /** this window counted as a spike (it set or extended the detection) */
     spike: boolean;
+    /** the spike was a loud impulse (else a sustained sound) */
+    impulse: boolean;
 }
 
 export class AudioDetector {
@@ -99,7 +118,9 @@ export class AudioDetector {
     private soundRun = 0;
     /** digital silence for silenceWindows: a status only */
     silent = false;
-    private consecutive = 0;
+    /** windows of the current sustained sound, its short gaps included (0 = none) */
+    private sustained = 0;
+    private gap = 0;
     private silentRun = 0;
     private cachedFloor: number | undefined;
     detected = false;
@@ -129,7 +150,7 @@ export class AudioDetector {
 
     /** A new stream starts: drop the per-run counters, keep the learned floor (same camera, same background). */
     resetRun() {
-        this.consecutive = 0;
+        this.sustained = 0;
         this.silentRun = 0;
         this.soundRun = 0;
         this.endRun();
@@ -166,7 +187,8 @@ export class AudioDetector {
         this.lastDb = w.db;
         const floor = this.floorDb;
         const flagged = floor !== undefined && w.db >= floor + c.sensitivityDb;
-        const spikeWindow = floor !== undefined && w.sustainedDb >= floor + c.sensitivityDb && w.sustainedDb >= c.absMinDb;
+        const loud = floor !== undefined && w.sustainedDb >= floor + c.sensitivityDb && w.sustainedDb >= c.absMinDb;
+        const impulse = floor !== undefined && w.db >= floor + c.impulseDb && w.db >= c.impulseMinDb;
         let rebaselined = false;
         const bin = binOf(w.db);
 
@@ -185,9 +207,16 @@ export class AudioDetector {
             }
         }
 
-        this.consecutive = spikeWindow ? this.consecutive + 1 : 0;
+        if (loud) {
+            this.sustained++;
+            this.gap = 0;
+        }
+        else if (this.sustained > 0 && ++this.gap <= c.gapWindows)
+            this.sustained++;
+        else
+            this.sustained = 0;
         const before = this.detected;
-        const spike = this.consecutive >= c.minSpikeWindows;
+        const spike = impulse || (loud && this.sustained >= c.minSustainedWindows);
         if (spike) {
             this.lastSpikeAt = now;
             this.lastSpikeWall = this.wall();
@@ -209,7 +238,7 @@ export class AudioDetector {
         if (this.silent && w.db >= c.absMinDb && ++this.soundRun >= c.silenceClearWindows)
             this.silent = false;
 
-        return { changed: before !== this.detected, detected: this.detected, silentChanged: wasSilent !== this.silent, rebaselined, spike };
+        return { changed: before !== this.detected, detected: this.detected, silentChanged: wasSilent !== this.silent, rebaselined, spike, impulse: spike && impulse };
     }
 
     /** ms until the hold ends (0 = ended or not detected). */
@@ -223,7 +252,7 @@ export class AudioDetector {
     expireAt(now: number): boolean {
         if (this.detected && this.holdLeft(now) <= 0) {
             this.detected = false;
-            this.consecutive = 0;
+            this.sustained = 0;
             return true;
         }
         return false;
@@ -233,7 +262,7 @@ export class AudioDetector {
     clear(): boolean {
         const was = this.detected;
         this.detected = false;
-        this.consecutive = 0;
+        this.sustained = 0;
         return was;
     }
 

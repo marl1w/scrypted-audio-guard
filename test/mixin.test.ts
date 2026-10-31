@@ -56,7 +56,7 @@ test('enabled by default: one process starts with the mixin; a sound sets audioD
     await flush();
     assert.equal(procs.length, 1);
     feed(-60, 120);
-    feed(-35, 3);
+    feed(-25, 3);
     assert.equal(m.audioDetected, true);
     clock.advance(10_000);
     assert.equal(m.audioDetected, false);
@@ -87,13 +87,23 @@ test('a stale audioDetected left on by a previous run is cleared at start', asyn
     await m.release();
 });
 
-test('settings: sensitivity and hold are clamped and applied live', async () => {
-    const { m, feed, clock } = make({ sensitivity: '99', hold: '2' });
+test('settings: defaults; sensitivity, hold, minimum level, duration and the loud-sound thresholds are clamped and applied live', async () => {
+    const d = make();
+    assert.deepEqual([d.m.detector.config.absMinDb, d.m.detector.config.minSustainedWindows, d.m.detector.config.impulseDb, d.m.detector.config.impulseMinDb], [-45, 10, 25, -30]);
+    await d.m.release();
+    const { m, feed, clock } = make({ sensitivity: '99', hold: '2', minLevel: '-200', duration: '99', impulse: '1', impulseLevel: '5' });
     await flush();
     assert.equal(m.detector.config.sensitivityDb, 40);
     assert.equal(m.detector.config.holdMs, 2000);
+    assert.equal(m.detector.config.absMinDb, -90);
+    assert.equal(m.detector.config.minSustainedWindows, 100);
+    assert.equal(m.detector.config.impulseDb, 6);
+    assert.equal(m.detector.config.impulseMinDb, 0);
     await m.putMixinSetting('sensitivity', 10);
+    await m.putMixinSetting('minLevel', -50);
+    await m.putMixinSetting('duration', 0.3);
     assert.equal(m.detector.config.sensitivityDb, 10);
+    assert.equal(m.detector.config.minSustainedWindows, 3);
     feed(-60, 120);
     feed(-48, 3);
     assert.equal(m.audioDetected, true);
@@ -108,13 +118,13 @@ test('status setting: read-only, shows state, level, floor and the last sound', 
     feed(-60, 50);
     assert.match(m.statusText(), /^Learning the background · level -60 dBFS · floor n\/a · last sound never$/);
     feed(-60, 100);
-    feed(-35, 3);
+    feed(-25, 3);
     const s = (await m.getMixinSettings())[0];
     assert.equal(s.key, 'status');
     assert.equal(s.readonly, true);
     assert.equal(s.type, 'html');
-    assert.match(m.statusText(), /^Sound detected · level -35 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d$/);
-    assert.match(String(s.value), /<div>Sound detected · level -35 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d<\/div>/);
+    assert.match(m.statusText(), /^Sound detected · level -25 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d$/);
+    assert.match(String(s.value), /<div>Sound detected · level -25 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d<\/div>/);
     assert.match(String(s.value), /Activity/);
     feed(-120, 700);
     assert.match(m.statusText(), /^Listening \(the audio is digital silence\) · level silent/);
@@ -139,7 +149,7 @@ test('release while a sound is detected: audioDetected is published off', async 
     const { m, feed, base } = make();
     await flush();
     feed(-60, 120);
-    feed(-35, 3);
+    feed(-25, 3);
     assert.equal(m.audioDetected, true);
     await m.release();
     assert.equal(m.audioDetected, false);
@@ -183,12 +193,12 @@ test('status html: the Activity chart is fed by the windows (level, floor, thres
     assert.match(empty, /Listening, no data yet/);
     await flush();
     feed(-60, 150);
-    feed(-35, 5);
+    feed(-25, 5);
     const b = m.activity.bucket(now(), 0)!;
     assert.ok(b, 'the current second has data');
     assert.equal(b.published, true);
     assert.equal(b.spike, true);
-    assert.equal(Math.round(b.level), -35);
+    assert.equal(Math.round(b.level), -25);
     assert.equal(b.floor, -60);
     assert.equal(b.threshold, -45, 'floor + sensitivity');
     const before = m.activity.bucket(now(), 3)!;
@@ -201,7 +211,7 @@ test('status html: the Activity chart is fed by the windows (level, floor, thres
     const row = m.overviewRow(now());
     assert.equal(row.state, 'Sound');
     assert.equal(row.detectionsHour, 1);
-    assert.equal(row.levelFloor, '-35 / -60 dBFS');
+    assert.equal(row.levelFloor, '-25 / -60 dBFS');
     assert.equal(row.lastSound, 'just now');
     await m.release();
 });
@@ -263,4 +273,38 @@ test('provider page: Overview and Performance html, one row per camera, totals a
     assert.deepEqual(p.totalsNow(), { wanted: 0, running: 0 });
     p.stopPerf();
     await p.releaseMixin('c1', m);
+});
+
+test('provider: a sound most cameras hear at the same moment is background and ignored; a sound at one camera is published 1 s later', async () => {
+    const p = new AudioGuardProvider('n');
+    const clock = new FakeClock();
+    const host = p as any;
+    host.timers = clock;
+    const feeds: ((w: WindowLevel) => void)[] = [];
+    host.starter = () => async (onWindow: (w: WindowLevel) => void) => { feeds.push(onWindow); return { stop() { }, exited: new Promise(() => { }) } as AudioProcess; };
+    const ms: AudioGuardMixin[] = [];
+    for (let i = 0; i < 5; i++)
+        ms.push(await p.getMixin({}, [] as any, { id: `c${i}`, store: {} } as any));
+    clock.advance(START_JITTER_MS);
+    await flush();
+    /** one window to each camera; loud ones get `db` */
+    const tick = (db: number, loud: number[]) => { clock.advance(100); feeds.forEach((f, i) => { const v = loud.includes(i) ? db : -60; f({ db: v, sustainedDb: v }); }); };
+    for (let i = 0; i < 150; i++)
+        tick(-60, []);
+    // 3 of 5 (60 %) within 1 s: a distant bang, wind
+    tick(-20, [0, 1]);
+    for (let i = 0; i < 5; i++) tick(-60, []);
+    tick(-20, [2]);
+    for (let i = 0; i < 30; i++) tick(-60, []);
+    assert.ok(ms.every(m => !m.audioDetected));
+    assert.ok(ms.every(m => m.detections.sum(clock.now()) === 0));
+    // one camera alone: published once the 1 s check has passed
+    tick(-20, [3]);
+    assert.ok(!ms[3].audioDetected, 'waits for the other cameras');
+    for (let i = 0; i < 10; i++) tick(-60, []);
+    assert.equal(ms[3].audioDetected, true);
+    assert.equal(ms[3].detections.sum(clock.now()), 1);
+    p.stopPerf();
+    for (let i = 0; i < 5; i++)
+        await p.releaseMixin(`c${i}`, ms[i]);
 });

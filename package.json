@@ -1,6 +1,6 @@
 {
   "name": "@marl1w/scrypted-audio-guard",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Scrypted plugin that turns a camera's audio into a standard AudioSensor: on when a sound rises clearly above the camera's own background, off in silence or steady noise.",
   "license": "MIT",
   "scripts": {
