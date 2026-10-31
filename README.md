@@ -43,11 +43,21 @@ The plugin cuts the PCM into 100 ms windows and computes each window's RMS level
 ## Settings (per camera)
 
 - **Status** (read-only): the state (Listening, Listening with the audio as digital silence, Learning the background, Sound detected, Reconnecting, No audio, Disabled), the stream used when it is not the low-resolution one, the current level, the floor and the time of the last sound. It refreshes when the page is opened.
+  Below it, the **Activity** chart shows the last 10 minutes, one point per second: the sound level (the loudest sustained level of the second's 100 ms windows, the value the detector compares, in dBFS), the noise floor (faint, dashed), the threshold (amber: floor plus Sensitivity, never below −50 dBFS), the seconds with a detected sound (red), and a **Sensor on** bar for when `audioDetected` was on. The lines break where there was no audio (no audio track, ffmpeg down or restarting). The dBFS axis follows the data between −90 and 0. The history is kept in memory (about 13 KB per camera) and lost on a plugin restart.
 - **Enabled** (on by default): off stops the camera's audio process; the sensor stays off.
 - **Sensitivity (dB)** (default 15, 6 to 40): how far above the background a sound must be. A lower value is more sensitive.
 - **Hold (s)** (default 10, 1 to 600): how long the sensor stays on after the last loud sound.
 
 The other values are fixed on purpose: windows of 100 ms, at least 2 windows, an absolute minimum of −50 dBFS, the 20th percentile over 5 min, 10 s of learning, silence at −90 dBFS for 60 s, a steady background within 6 dB.
+
+## Plugin page
+
+The plugin's own settings page shows:
+
+- **Overview:** one row per camera with its state (Listening, Silent, Learning, Sound, Starting, Restarting, No audio, Disabled), the current level and floor while ffmpeg runs, how long ago the last sound was, and the sounds and restarts of the last hour.
+- **Performance:** the ffmpeg processes running out of those wanted (cameras without audio are not counted), the audio windows per second against the expected 10 per running camera, the plugin process CPU (ffmpeg not included) and memory, and CPU and memory sparklines over the last hour (one sample per minute, in memory).
+
+Both are computed when the page is opened.
 
 ## CPU
 

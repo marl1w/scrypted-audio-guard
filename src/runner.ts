@@ -1,8 +1,9 @@
 // Lifecycle of one camera's audio process: start, restart with backoff, watchdog, "no audio" (no audio track) with a long
 // backoff, and the hold timer. Digital silence is only a status: the process keeps running and detecting. The process itself is injected (src/source.ts in the plugin, a fake in the tests), and so is the clock.
 
-import { AudioDetector } from './detector';
+import { AudioDetector, PushResult } from './detector';
 import { WindowLevel } from './pcm';
+import { MinuteCounter } from './status';
 import { backoffMs, maskUrls } from './util';
 
 export interface AudioProcess {
@@ -57,6 +58,8 @@ export type RunnerState = 'stopped' | 'starting' | 'running' | 'restarting' | 'n
 
 export interface RunnerEvents {
     onDetected(on: boolean): void;
+    /** every window, after the detector (the status history): must be O(1) */
+    onLevel?(w: WindowLevel, r: PushResult, now: number): void;
     log(msg: string): void;
     warn(msg: string): void;
 }
@@ -69,6 +72,8 @@ export class AudioRunner {
     nextStartAt: number | undefined;
     lastError: string | undefined;
     starts = 0;
+    /** restarts after a failure (ended, stalled, start failed), per minute over the last hour */
+    readonly restarts = new MinuteCounter();
 
     private proc: AudioProcess | undefined;
     private gen = 0;
@@ -187,6 +192,7 @@ export class AudioRunner {
             this.noAudioCount = 0;
         }
         const r = this.detector.push(w, now);
+        this.ev.onLevel?.(w, r, now);
         if (r.silentChanged)
             this.ev.log(this.detector.silent ? 'the audio is digital silence (still listening)' : 'the audio is no longer digital silence');
         if (r.rebaselined)
@@ -258,6 +264,7 @@ export class AudioRunner {
         if (this.firstWindowAt !== undefined && now - this.firstWindowAt >= CLEAN_RUN_MS)
             this.attempt = 0;
         this.lastError = err || 'ended';
+        this.restarts.add(now);
         const delay = Math.round(restartDelayMs(this.attempt++) * jitter(this.t.random()));
         if (this.attempt === 1)
             this.ev.warn(`audio process ended (${maskUrls(this.lastError)}); restarting with backoff`);

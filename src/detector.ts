@@ -79,6 +79,8 @@ export interface PushResult {
     silentChanged: boolean;
     /** the floor was rebuilt from a sustained louder background with this window */
     rebaselined: boolean;
+    /** this window counted as a spike (it set or extended the detection) */
+    spike: boolean;
 }
 
 export class AudioDetector {
@@ -185,7 +187,8 @@ export class AudioDetector {
 
         this.consecutive = spikeWindow ? this.consecutive + 1 : 0;
         const before = this.detected;
-        if (this.consecutive >= c.minSpikeWindows) {
+        const spike = this.consecutive >= c.minSpikeWindows;
+        if (spike) {
             this.lastSpikeAt = now;
             this.lastSpikeWall = this.wall();
             this.detected = true;
@@ -206,7 +209,7 @@ export class AudioDetector {
         if (this.silent && w.db >= c.absMinDb && ++this.soundRun >= c.silenceClearWindows)
             this.silent = false;
 
-        return { changed: before !== this.detected, detected: this.detected, silentChanged: wasSilent !== this.silent, rebaselined };
+        return { changed: before !== this.detected, detected: this.detected, silentChanged: wasSilent !== this.silent, rebaselined, spike };
     }
 
     /** ms until the hold ends (0 = ended or not detected). */

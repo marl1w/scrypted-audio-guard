@@ -112,7 +112,10 @@ test('status setting: read-only, shows state, level, floor and the last sound', 
     const s = (await m.getMixinSettings())[0];
     assert.equal(s.key, 'status');
     assert.equal(s.readonly, true);
-    assert.match(String(s.value), /^Sound detected · level -35 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d$/);
+    assert.equal(s.type, 'html');
+    assert.match(m.statusText(), /^Sound detected · level -35 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d$/);
+    assert.match(String(s.value), /<div>Sound detected · level -35 dBFS · floor -60 dBFS · last sound \d\d:\d\d:\d\d<\/div>/);
+    assert.match(String(s.value), /Activity/);
     feed(-120, 700);
     assert.match(m.statusText(), /^Listening \(the audio is digital silence\) · level silent/);
     procs[0].end(`${NO_AUDIO_TRACK} (matches no streams)`);
@@ -171,4 +174,93 @@ test('provider: concurrent getMixin calls for one camera leave exactly one live 
     assert.equal((p as any).live.get('c2'), c);
     assert.equal(c.released, false);
     await p.releaseMixin('c2', c);
+});
+
+test('status html: the Activity chart is fed by the windows (level, floor, threshold, sound, Published)', async () => {
+    const { m, feed, clock } = make();
+    const now = () => clock.now();
+    const empty = m.statusHtml(now());
+    assert.match(empty, /Listening, no data yet/);
+    await flush();
+    feed(-60, 150);
+    feed(-35, 5);
+    const b = m.activity.bucket(now(), 0)!;
+    assert.ok(b, 'the current second has data');
+    assert.equal(b.published, true);
+    assert.equal(b.spike, true);
+    assert.equal(Math.round(b.level), -35);
+    assert.equal(b.floor, -60);
+    assert.equal(b.threshold, -45, 'floor + sensitivity');
+    const before = m.activity.bucket(now(), 3)!;
+    assert.equal(before.spike, false);
+    assert.equal(before.published, false);
+    const html = m.statusHtml(now());
+    assert.match(html, /<title>sound, 1 s<\/title>/);
+    assert.match(html, /stroke-dasharray="4 3"/, 'floor line');
+    assert.match(html, /stroke="#d9930d" stroke-width="1.5" stroke-linejoin="round"\/>/, 'threshold line');
+    const row = m.overviewRow(now());
+    assert.equal(row.state, 'Sound');
+    assert.equal(row.detectionsHour, 1);
+    assert.equal(row.levelFloor, '-35 / -60 dBFS');
+    assert.equal(row.lastSound, 'just now');
+    await m.release();
+});
+
+test('status history: the chart level is the sustained level (what the detector compares), not the window RMS', async () => {
+    const { m, procs, clock } = make();
+    await flush();
+    clock.advance(100);
+    procs[0].onWindow({ db: -20, sustainedDb: -70 }); // a click: loud window, quiet half
+    assert.equal(m.activity.bucket(clock.now(), 0)!.level, -70);
+    assert.match(m.overviewRow().levelFloor, /^-20 \//, 'the overview shows the live window level');
+    await m.release();
+});
+
+test('overview row: no live level unless ffmpeg is running; a silent camera is grey', async () => {
+    const { m, feed } = make();
+    assert.equal(m.runner.state, 'starting', 'ffmpeg not started yet');
+    m.detector.lastDb = -50;
+    assert.equal(m.overviewRow().levelFloor, '—');
+    await flush();
+    assert.equal(m.runner.state, 'running');
+    feed(-60, 150);
+    assert.equal(m.overviewRow().levelFloor, '-60 / -60 dBFS');
+    m.detector.silent = true;
+    assert.deepEqual(m.shortState(), { state: 'Silent', color: '#8b8b8b' });
+    await m.release();
+});
+
+test('status html: a disabled camera shows its empty state', async () => {
+    const { m } = make({ enabled: 'false' });
+    assert.match(m.statusHtml(), /Disabled, no data/);
+    assert.equal(m.shortState().state, 'Disabled');
+    await m.release();
+});
+
+test('provider page: Overview and Performance html, one row per camera, totals and windows counted', async () => {
+    const p = new AudioGuardProvider('n');
+    const clock = new FakeClock();
+    const host = p as any;
+    host.timers = clock;
+    let feed!: (w: WindowLevel) => void;
+    host.starter = () => async (onWindow: (w: WindowLevel) => void) => { feed = onWindow; return { stop() { }, exited: new Promise(() => { }) } as AudioProcess; };
+    const m: AudioGuardMixin = await p.getMixin({}, [] as any, { id: 'c1', store: {} } as any);
+    clock.advance(START_JITTER_MS);
+    await flush();
+    for (let i = 0; i < 20; i++) { clock.advance(100); feed({ db: -60, sustainedDb: -60 }); }
+    assert.equal(p.totals.windows, 20);
+    const s = await p.getSettings();
+    assert.deepEqual(s.map(x => x.key), ['overview', 'performance']);
+    assert.ok(s.every(x => x.readonly && x.type === 'html'));
+    assert.match(String(s[0].value), /Cam 1/);
+    assert.match(String(s[0].value), /Learning/);
+    assert.match(String(s[1].value), /ffmpeg running/);
+    assert.match(String(s[1].value), />1 of 1</);
+    assert.match(String(s[1].value), />1 of 1</);
+    // a camera without audio is not wanted: not counted in the denominator
+    (m.runner as any).noAudio = 'no audio track';
+    (m.runner as any).state = 'no audio';
+    assert.deepEqual(p.totalsNow(), { wanted: 0, running: 0 });
+    p.stopPerf();
+    await p.releaseMixin('c1', m);
 });

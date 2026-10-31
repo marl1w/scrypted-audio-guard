@@ -4,9 +4,11 @@ import { StorageSettings } from '@scrypted/sdk/storage-settings';
 
 import { AudioDetector, DEFAULT_DETECTOR, DEFAULT_HOLD_S, DEFAULT_SENSITIVITY_DB } from './detector';
 import { candidates, FallbackStarter } from './fallback';
+import { OverviewCamera } from './overview';
 import { MIN_DB } from './pcm';
 import { AudioRunner, AudioStarter, realTimers, Timers } from './runner';
 import { startAudio, STREAM_RESOLVE_MS } from './source';
+import { ActivityRing, C, MinuteCounter, relTime, renderStatus } from './status';
 import { clockTime, maskUrls, withTimeout } from './util';
 
 export const SENSITIVITY_RANGE: [number, number] = [6, 40];
@@ -23,6 +25,8 @@ export interface MixinHost {
     starter?: (m: AudioGuardMixin) => AudioStarter;
     /** tests replace the clock */
     timers?: Timers;
+    /** plugin-wide counters: 100 ms windows of all cameras (the provider's throughput figure) */
+    totals?: { windows: number };
 }
 
 export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implements AudioSensor {
@@ -53,6 +57,10 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
     readonly detector: AudioDetector;
     readonly runner: AudioRunner;
     readonly fallback: FallbackStarter;
+    /** the last 10 min, one bucket per second (Status setting) */
+    readonly activity = new ActivityRing();
+    /** sounds (audioDetected turned on) per minute over the last hour (plugin overview) */
+    readonly detections = new MinuteCounter();
     private released = false;
     private listeners: EventListenerRegister[] = [];
 
@@ -70,6 +78,7 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         const starter: AudioStarter = host.starter?.(this) ?? this.fallback.start;
         this.runner = new AudioRunner(starter, this.detector, {
             onDetected: on => this.publish(on),
+            onLevel: (w, r, now) => this.record(w.sustainedDb, r.spike, r.detected, now),
             log: m => this.console.log(m),
             warn: m => this.console.warn(maskUrls(m)),
         }, host.timers ?? realTimers);
@@ -118,11 +127,61 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
     private publish(on: boolean) {
         if (this.released)
             return;
+        if (on)
+            this.detections.add(this.now());
         this.audioDetected = on;
     }
 
+    private now(): number {
+        return (this.host.timers ?? realTimers).now();
+    }
+
+    /** one window into the status history: O(1), no allocation. db is the window's sustained level, the one compared with the threshold. */
+    private record(db: number, spike: boolean, detected: boolean, now: number) {
+        const floor = this.detector.floorDb;
+        const c = this.detector.config;
+        // the threshold a window's sustained level must reach: floor + sensitivity, never below the absolute minimum
+        const threshold = floor === undefined ? undefined : Math.max(floor + c.sensitivityDb, c.absMinDb);
+        this.activity.add(now, db, floor, threshold, spike, detected);
+        if (this.host.totals)
+            this.host.totals.windows++;
+    }
+
+    /** Short state for the plugin overview, with its chip colour. */
+    shortState(): { state: string; color: string } {
+        const r = this.runner, d = this.detector;
+        if (r.state === 'stopped')
+            return { state: 'Disabled', color: C.gray };
+        if (r.noAudio)
+            return { state: 'No audio', color: C.gray };
+        if (r.state === 'restarting')
+            return { state: 'Restarting', color: C.amber };
+        if (r.state === 'starting')
+            return { state: 'Starting', color: C.blue };
+        if (d.learning)
+            return { state: 'Learning', color: C.blue };
+        if (d.detected)
+            return { state: 'Sound', color: C.red };
+        return r.silent ? { state: 'Silent', color: C.gray } : { state: 'Listening', color: C.green };
+    }
+
+    /** One row of the plugin overview. */
+    overviewRow(now = this.now()): OverviewCamera {
+        const d = this.detector;
+        const live = this.runner.state === 'running';
+        const db = (v: number | undefined) => v === undefined ? 'n/a' : v <= MIN_DB ? 'silent' : v.toFixed(0);
+        return {
+            name: String(this.name || this.id || '?'),
+            ...this.shortState(),
+            restartsHour: this.runner.restarts.sum(now),
+            detectionsHour: this.detections.sum(now),
+            lastSound: relTime(d.lastSpikeWall, Date.now()),
+            levelFloor: live && d.lastDb !== undefined ? `${db(d.lastDb)} / ${db(d.floorDb)} dBFS` : '—',
+        };
+    }
+
     /** One line: state, current level, floor, last spike. */
-    statusText(now = (this.host.timers ?? realTimers).now()): string {
+    statusText(now = this.now()): string {
         const r = this.runner, d = this.detector;
         const db = (v: number | undefined) => v === undefined ? 'n/a' : v <= MIN_DB ? 'silent' : `${v.toFixed(0)} dBFS`;
         const until = (t: number | undefined) => t === undefined ? '' : `, next try in ${Math.max(0, Math.round((t - now) / 1000))} s`;
@@ -149,14 +208,22 @@ export class AudioGuardMixin extends SettingsMixinDeviceBase<VideoCamera> implem
         return parts.join(' · ');
     }
 
+    /** Status line and the Activity chart (html), computed now: only when the settings page is requested. */
+    statusHtml(now = this.now()): string {
+        const r = this.runner;
+        const empty = r.state === 'stopped' ? 'Disabled, no data' : r.noAudio ? 'No audio, no data' : 'Listening, no data yet';
+        return renderStatus(this.statusText(now), this.activity, now, empty);
+    }
+
     async getMixinSettings(): Promise<Setting[]> {
         const settings = await this.storageSettings.getSettings();
         settings.unshift({
             key: 'status',
             title: 'Status',
             description: 'Refreshed when the page is opened.',
+            type: 'html',
             readonly: true,
-            value: this.statusText(),
+            value: this.statusHtml(),
         });
         return settings;
     }

@@ -1,20 +1,71 @@
-import sdk, { MixinProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, WritableDeviceState } from '@scrypted/sdk';
+import sdk, { MixinProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue, WritableDeviceState } from '@scrypted/sdk';
 
 import { AudioGuardMixin, MixinHost } from './mixin';
+import { ProcRing, renderOverview, renderPerformance, Totals } from './overview';
+import { realTimers } from './runner';
 
 /** Marker interface: at most one Audio Guard mixin per camera (objectdetector pattern). */
 const MARKER = 'scrypted-audio-guard:mixin';
 /** a hung lookup of Scrypted's ffmpeg must not stall a camera's start for ever */
 const FFMPEG_PATH_TIMEOUT_MS = 10_000;
+/** the plugin process is sampled (CPU, memory, throughput) once a minute; the page renders from the ring */
+export const PERF_SAMPLE_MS = 60_000;
 
-export class AudioGuardProvider extends ScryptedDeviceBase implements MixinProvider, MixinHost {
+export class AudioGuardProvider extends ScryptedDeviceBase implements MixinProvider, MixinHost, Settings {
     // Enabling is opt-in: nothing here calls setMixins, so the user turns the extension on per camera.
     private live = new Map<string, AudioGuardMixin>();
     /** Scrypted's ffmpeg, looked up once (again after a failed lookup) */
     private ffmpegLookup: Promise<string> | undefined;
+    /** windows of all cameras since the plugin started (counted by the mixins) */
+    readonly totals = { windows: 0 };
+    /** the last hour, one sample per minute */
+    readonly perf = new ProcRing(60);
+    private perfTimer: NodeJS.Timeout | undefined;
 
     constructor(nativeId?: string) {
         super(nativeId);
+        this.samplePerf(); // baseline: the first minute then has a CPU figure
+        this.perfTimer = setInterval(() => this.samplePerf(), PERF_SAMPLE_MS);
+        this.perfTimer.unref?.();
+    }
+
+    /** stops the per-minute sampler (tests; Scrypted ends the whole process on a plugin restart) */
+    stopPerf() {
+        clearInterval(this.perfTimer);
+        this.perfTimer = undefined;
+    }
+
+    /** One per-minute sample of the plugin's own process: O(1), a single object. */
+    samplePerf(now = realTimers.now()) {
+        const cpu = process.cpuUsage();
+        this.perf.sample(now, cpu.user + cpu.system, process.memoryUsage().rss, this.totals.windows);
+    }
+
+    private cameras(): AudioGuardMixin[] {
+        return [...this.live.values()];
+    }
+
+    totalsNow(): Totals {
+        const cams = this.cameras();
+        return {
+            // a camera without audio is not counted, unless its periodic check is running right now
+            wanted: cams.filter(m => m.runner.state !== 'stopped' && (!m.runner.noAudio || m.runner.state === 'running')).length,
+            running: cams.filter(m => m.runner.state === 'running').length,
+        };
+    }
+
+    /** Plugin page: rendered when it is requested, never pushed. */
+    async getSettings(): Promise<Setting[]> {
+        const now = realTimers.now();
+        const rows = this.cameras().map(m => { try { return m.overviewRow(now); } catch { return undefined; } }).filter(r => r !== undefined);
+        return [
+            { key: 'overview', group: 'Overview', title: 'Cameras', type: 'html', readonly: true, description: 'Refreshed when the page is opened.', value: renderOverview(rows) },
+            { key: 'performance', group: 'Performance', title: 'Plugin', type: 'html', readonly: true, description: 'Refreshed when the page is opened.', value: renderPerformance(this.totalsNow(), this.perf) },
+        ];
+    }
+
+    async putSetting(_key: string, _value: SettingValue): Promise<void> {
+        // read-only page
     }
 
     ffmpegPath(): Promise<string> {
