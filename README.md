@@ -5,7 +5,7 @@ A Scrypted plugin that listens to each camera's audio and turns it into the stan
 ## What you get
 
 - A sound sensor per camera, learned from the camera's own background: there is no absolute threshold to tune per room.
-- It works everywhere Scrypted devices go. The Scrypted MQTT bridge (and so Home Assistant) shows it as a `binary_sensor` with device class `sound`. Scrypted Stamina uses it as an event trigger.
+- It works everywhere Scrypted devices go. A camera-device integration such as scrypted-mqtt-ha (and so Home Assistant) can show it as a `binary_sensor` with device class `sound`. An event detector such as scrypted-stamina can use it as an event trigger.
 - It is cheap: one small audio-only ffmpeg per enabled camera. No video is decoded, and on Rebroadcast's RTSP stream the video is not even sent (see [CPU](#cpu)).
 - It is honest about cameras without audio. A camera whose streams have no audio track shows "No audio" and is checked again later, less and less often. A camera that sends digital silence (audio gated or turned off) shows that on its Status line, but is still listened to.
 
@@ -67,8 +67,8 @@ A 20 s capture of a camera's RTMP substream (640 px video, AAC audio) through Re
 
 ## How others use it
 
-- **Scrypted MQTT bridge / Home Assistant:** the AudioSensor appears as a sound `binary_sensor` on the camera's device (`on` while `audioDetected` is true).
-- **Scrypted Stamina:** reads `audioDetected` through the standard AudioSensor interface. By default it is an event trigger. Any other plugin that implements AudioSensor works the same way.
+- **Camera-device integrations such as scrypted-mqtt-ha:** the AudioSensor can appear as a sound `binary_sensor` on the camera's device (`on` while `audioDetected` is true).
+- **Event detectors such as scrypted-stamina:** read `audioDetected` through the standard AudioSensor interface, and by default treat it as an event trigger. Any other plugin that implements AudioSensor works the same way.
 
 ## Troubleshooting
 
