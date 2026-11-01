@@ -18,7 +18,8 @@ export interface WindowLevel {
     highDb?: number;
 }
 
-/** the high band starts here (Hz): 2nd-order Butterworth high-pass */
+/** the high band starts here (Hz): two cascaded 2nd-order Butterworth high-passes (24 dB per octave), so a strong tone
+ *  at 400-500 Hz (an engine, a horn) does not leak into it */
 export const HIGH_HZ = 1000;
 
 /** RBJ biquad high-pass coefficients (Q = 1/sqrt(2)), normalised by a0: [b0, b1, b2, a1, a2] */
@@ -59,6 +60,8 @@ export class PcmWindower {
     private x2 = 0;
     private y1 = 0;
     private y2 = 0;
+    private z1 = 0;
+    private z2 = 0;
 
     push(chunk: Uint8Array, onWindow: (w: WindowLevel) => void) {
         let i = 0;
@@ -82,9 +85,13 @@ export class PcmWindower {
         const y = HB0 * s + HB1 * this.x1 + HB2 * this.x2 - HA1 * this.y1 - HA2 * this.y2;
         this.x2 = this.x1;
         this.x1 = s;
+        // second stage: input y, output z
+        const z = HB0 * y + HB1 * this.y1 + HB2 * this.y2 - HA1 * this.z1 - HA2 * this.z2;
         this.y2 = this.y1;
         this.y1 = y;
-        this.sumHigh += y * y;
+        this.z2 = this.z1;
+        this.z1 = z;
+        this.sumHigh += z * z;
         if (++this.count === WINDOW_SAMPLES) {
             const db = toDb(this.sum1 + this.sum2, WINDOW_SAMPLES);
             const sustainedDb = Math.min(toDb(this.sum1, HALF), toDb(this.sum2, HALF));

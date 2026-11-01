@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AudioDetector, DEFAULT_DETECTOR, PushResult } from '../src/detector';
 import { WindowLevel } from '../src/pcm';
-import { mix, noise, overlay, rng, rumble, silence, voice, windows } from './synth';
+import { mix, noise, overlay, rng, rumble, silence, sine, voice, windows } from './synth';
 
 /** feeds windows 100 ms apart; returns the push results and the times detected changed */
 function feed(d: AudioDetector, ws: WindowLevel[], t0 = 0) {
@@ -290,4 +290,11 @@ test('the wind check applies only when the high band is measured', () => {
     assert.equal(d.push({ db: -15, sustainedDb: -15, highDb: -40 }, 15_000).spike, false, 'rumble: 25 dB below');
     assert.equal(d.push({ db: -15, sustainedDb: -15, highDb: -25 }, 15_100).spike, true, '10 dB below: a sound');
     assert.equal(d.push({ db: -15, sustainedDb: -15 }, 15_200).spike, true, 'not measured: no check');
+});
+
+test('a distant engine or horn: a 450 Hz tone with its 900 Hz harmonic, loud over a quiet background, does not detect', () => {
+    const d = new AudioDetector();
+    const tone = mix(sine(-28, 450, 3000), sine(-36, 900, 3000));
+    const r = feed(d, windows(noise(-62, 60_000, rng(90)), tone, noise(-62, 20_000, rng(91))));
+    assert.deepEqual(r.on, []);
 });

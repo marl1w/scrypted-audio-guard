@@ -11,7 +11,7 @@
 //     that long.
 // - Wind: a window whose level above 1 kHz is more than lowRumbleDb (14 dB) below its full level counts for neither
 //   tier. Wind buffeting an outdoor microphone puts nearly all its energy below 300 Hz (often 35 dB and more between the
-//   two levels, even when the gust clips); breaking glass, a shout, a bark or a bang carry a good share above 1 kHz.
+//   two levels, even when the gust clips), and a distant engine or horn sits at a few hundred hertz; breaking glass, a shout, a bark or a bang carry a good share above 1 kHz.
 // - Hold: detected stays on until holdMs after the last spike window.
 // - Step change: when the background itself jumps (a fan, rain) the loud windows stay out of the floor. A "run" starts
 //   at the first loud window and records EVERY window from then on (quiet gaps included) until runGapWindows quiet

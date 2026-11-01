@@ -44,6 +44,8 @@ test('high band: above 1 kHz passes, wind-like rumble below 300 Hz is far below 
         assert.ok(w.db - w.highDb! < 3, `white noise: ${w.highDb} vs ${w.db}`);
     for (const w of level(voice(-20, 500)))
         assert.ok(w.db - w.highDb! < 10, `voice: ${w.highDb} vs ${w.db}`);
+    for (const w of level(sine(-30, 450, 500)))
+        assert.ok(w.db - w.highDb! > 20, `450 Hz (an engine, a horn): ${w.highDb} vs ${w.db}`);
     for (const w of level(sine(-30, 100, 500)))
         assert.ok(w.db - w.highDb! > 30, `100 Hz: ${w.highDb} vs ${w.db}`);
     for (const w of level(rumble(-15, 2000)))
