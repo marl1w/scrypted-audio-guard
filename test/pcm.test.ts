@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MIN_DB, PcmWindower, rmsDbfs, WINDOW_SAMPLES } from '../src/pcm';
-import { noise, overlay, silence, sine, windows } from './synth';
+import { noise, overlay, rumble, silence, sine, voice, windows } from './synth';
 
 test('a full-scale sine is -3 dBFS, a -40 dBFS sine reads -40', () => {
     const full = Buffer.alloc(WINDOW_SAMPLES * 2);
@@ -34,4 +34,18 @@ test('sustained level: a click in one half of a window leaves the quieter half a
     const [w] = windows(overlay(noise(-60, 100), noise(-20, 20, undefined), 70));
     assert.ok(w.db > -35, `window level ${w.db}`);
     assert.ok(w.sustainedDb < -58, `sustained ${w.sustainedDb}`);
+});
+
+test('high band: above 1 kHz passes, wind-like rumble below 300 Hz is far below the full level', () => {
+    const level = (pcm: Buffer) => windows(pcm).slice(2); // past the filter's start
+    for (const w of level(sine(-30, 2500, 500)))
+        assert.ok(Math.abs(w.highDb! - w.db) < 1, `2.5 kHz: ${w.highDb} vs ${w.db}`);
+    for (const w of level(noise(-30, 500)))
+        assert.ok(w.db - w.highDb! < 3, `white noise: ${w.highDb} vs ${w.db}`);
+    for (const w of level(voice(-20, 500)))
+        assert.ok(w.db - w.highDb! < 10, `voice: ${w.highDb} vs ${w.db}`);
+    for (const w of level(sine(-30, 100, 500)))
+        assert.ok(w.db - w.highDb! > 30, `100 Hz: ${w.highDb} vs ${w.db}`);
+    for (const w of level(rumble(-15, 2000)))
+        assert.ok(w.db - w.highDb! > 20, `rumble: ${w.highDb} vs ${w.db}`);
 });

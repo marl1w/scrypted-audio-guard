@@ -27,6 +27,54 @@ export function noise(db: number | ((i: number) => number), ms: number, r = rng(
     return buf;
 }
 
+/** Wind on a microphone: white noise through two one-pole low-passes at ~100 Hz, scaled to an RMS of `db` dBFS and clipped
+ *  at full scale (a gust can overload the microphone). It swells in and dies out over 100 ms, as a gust does. */
+export function rumble(db: number, ms: number, r = rng()): Buffer {
+    const n = Math.round((SAMPLE_RATE * ms) / 1000);
+    const k = 1 - Math.exp((-2 * Math.PI * 100) / SAMPLE_RATE);
+    const y = new Float64Array(n);
+    let a = 0, b = 0, sum = 0;
+    for (let i = 0; i < n; i++) {
+        a += k * (r() * 2 - 1 - a);
+        b += k * (a - b);
+        y[i] = b;
+        sum += b * b;
+    }
+    const gain = (Math.pow(10, db / 20) * 32768) / Math.sqrt(sum / n || 1);
+    const buf = Buffer.alloc(n * 2);
+    const fade = Math.min(n / 2, SAMPLE_RATE / 10);
+    for (let i = 0; i < n; i++) {
+        const env = Math.min(1, i / fade, (n - 1 - i) / fade);
+        buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(y[i] * gain * env))), i * 2);
+    }
+    return buf;
+}
+
+/** Sum of two buffers of the same length (clipped). */
+export function mix(a: Buffer, b: Buffer): Buffer {
+    const out = Buffer.alloc(a.length);
+    for (let i = 0; i + 1 < a.length; i += 2)
+        out.writeInt16LE(Math.max(-32768, Math.min(32767, a.readInt16LE(i) + (i + 1 < b.length ? b.readInt16LE(i) : 0))), i);
+    return out;
+}
+
+/** A shout-like voice: a 300 Hz fundamental and its harmonics up to 3 kHz, falling 3 dB per harmonic, RMS `db` dBFS. */
+export function voice(db: number, ms: number): Buffer {
+    const n = Math.round((SAMPLE_RATE * ms) / 1000);
+    const y = new Float64Array(n);
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+        for (let h = 1; h * 300 <= 3000; h++)
+            y[i] += Math.pow(10, (-3 * (h - 1)) / 20) * Math.sin((2 * Math.PI * 300 * h * i) / SAMPLE_RATE);
+        sum += y[i] * y[i];
+    }
+    const gain = (Math.pow(10, db / 20) * 32768) / Math.sqrt(sum / n);
+    const buf = Buffer.alloc(n * 2);
+    for (let i = 0; i < n; i++)
+        buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(y[i] * gain))), i * 2);
+    return buf;
+}
+
 export function silence(ms: number): Buffer {
     return Buffer.alloc(Math.round((SAMPLE_RATE * ms) / 1000) * 2);
 }

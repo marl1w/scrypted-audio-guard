@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AudioDetector, DEFAULT_DETECTOR, PushResult } from '../src/detector';
 import { WindowLevel } from '../src/pcm';
-import { noise, overlay, rng, silence, windows } from './synth';
+import { mix, noise, overlay, rng, rumble, silence, voice, windows } from './synth';
 
 /** feeds windows 100 ms apart; returns the push results and the times detected changed */
 function feed(d: AudioDetector, ws: WindowLevel[], t0 = 0) {
@@ -253,4 +253,41 @@ test('a loud steady sound (an idling engine at -25 dBFS for 2 min) is not rebuil
     assert.equal(r.res.filter(x => x.rebaselined).length, 0);
     assert.equal(d.detected, true);
     assert.ok(Math.abs(d.floorDb! - -65) < 1.5, `floor ${d.floorDb}`);
+});
+
+test('wind on the microphone: loud gusts (up to clipping) over a quiet background never detect', () => {
+    const d = new AudioDetector();
+    const r = rng(60);
+    const parts: Buffer[] = [noise(-60, 60_000, rng(61))];
+    // a gust every 20 s for 10 min: 0.3 to 4 s long, -30 to -3 dBFS (clips), all below 300 Hz
+    for (let i = 0; i < 30; i++)
+        parts.push(rumble(-30 + 27 * r(), 300 + 3700 * r(), rng(62 + i)), noise(-60, 20_000 - 2000, rng(100 + i)));
+    const res = feed(d, windows(...parts));
+    assert.deepEqual(res.on, []);
+});
+
+test('short real sounds still count over a quiet background: glass, a shout, a bang', () => {
+    for (const [name, sound] of [['glass', noise(-20, 300)], ['shout', voice(-20, 400)], ['bang', noise(-15, 100)]] as const) {
+        const d = new AudioDetector();
+        const r = feed(d, windows(overlay(noise(-60, 90_000, rng(70)), sound, 60_000)));
+        assert.equal(r.on.length, 1, name);
+        assert.ok(r.on[0] >= 60_000 && r.on[0] <= 60_200, `${name} at ${r.on[0]}`);
+    }
+});
+
+test('a shout during a wind gust still counts', () => {
+    const d = new AudioDetector();
+    const gust = rumble(-25, 3000, rng(80));
+    const withShout = mix(gust, overlay(silence(3000), voice(-15, 500), 1000));
+    const r = feed(d, windows(noise(-60, 60_000, rng(81)), withShout, noise(-60, 20_000, rng(82))));
+    assert.equal(r.on.length, 1);
+    assert.ok(r.on[0] >= 61_000 && r.on[0] <= 61_200, `on at ${r.on[0]}`);
+});
+
+test('the wind check applies only when the high band is measured', () => {
+    const d = new AudioDetector();
+    feed(d, Array.from({ length: 150 }, () => ({ db: -60, sustainedDb: -60, highDb: -62 })));
+    assert.equal(d.push({ db: -15, sustainedDb: -15, highDb: -40 }, 15_000).spike, false, 'rumble: 25 dB below');
+    assert.equal(d.push({ db: -15, sustainedDb: -15, highDb: -25 }, 15_100).spike, true, '10 dB below: a sound');
+    assert.equal(d.push({ db: -15, sustainedDb: -15 }, 15_200).spike, true, 'not measured: no check');
 });

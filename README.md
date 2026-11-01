@@ -23,6 +23,7 @@ The plugin cuts the PCM into 100 ms windows and computes each window's RMS level
 - **A sound** counts through one of two tiers:
   - **Loud sound (impulse):** a single window at **Loud sound above the background** (default +25 dB) over the floor or more, and at or above **Loud sound level** (default −30 dBFS). A bang, a door slam or breaking glass counts at once, however short.
   - **Sustained sound:** windows at **floor + Sensitivity** or more and at or above **Minimum level** (default −45 dBFS), for **Minimum duration** (default 1 s), at least 60 % of it loud. Pauses of up to 0.2 s (between words or steps) do not break it. Here a window counts only if both of its 50 ms halves are loud, so a click does not.
+  - **Wind on the microphone:** a window whose level above 1 kHz is more than 14 dB below its whole level counts for neither tier. Wind buffeting an outdoor microphone puts nearly all its energy below 300 Hz, even when a gust is loud enough to clip; breaking glass, a shout, a bark or a bang carry a good share of theirs above 1 kHz.
 
   The camera's own noise (IR-cut clicks, codec glitches, electronics) is faint and short, so it passes neither tier. Measured on outdoor Reolink cameras at night, these defaults turn about 60 false sounds per hour on a quiet camera into none (see [Defaults](#defaults)).
 - **Background check:** with three or more cameras listening, a new sound waits 1 s before it is published. It is background (a gust of wind, rain, a distant bang or fireworks) and is not published when at least 60 % of the other listening cameras, and at least two, had a sound from 1 s before its start (its first loud window) on, about as loud above their own floors (at most 6 dB quieter than on this camera). So the camera where a sound is clearly loudest is never suppressed: the others heard it fainter, and it happened near that camera. An ignored sound shows as "Background" on the Status line and the plugin page, and is not checked again while it goes on. The camera's console logs "background check: sound ignored", at most once a minute (the others are counted). With fewer than three cameras listening there is no check and no delay.
@@ -58,7 +59,7 @@ The plugin cuts the PCM into 100 ms windows and computes each window's RMS level
 
 Values outside a range are clamped when they are saved.
 
-The other values are fixed on purpose: windows of 100 ms, pauses of up to 0.2 s inside a sustained sound, the 20th percentile over 5 min, 10 s of learning, silence at −90 dBFS for 60 s, a steady background within 6 dB, and the background check (at least 3 listening cameras; 60 % of the others, at least two, within 1 s and within 6 dB).
+The other values are fixed on purpose: windows of 100 ms, pauses of up to 0.2 s inside a sustained sound, the 20th percentile over 5 min, 10 s of learning, silence at −90 dBFS for 60 s, a steady background within 6 dB, the wind check (1 kHz, 14 dB), and the background check (at least 3 listening cameras; 60 % of the others, at least two, within 1 s and within 6 dB).
 
 ### Defaults
 

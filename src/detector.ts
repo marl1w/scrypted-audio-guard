@@ -9,6 +9,9 @@
 //     absMinDb, for minSustainedWindows (1 s), at least MIN_LOUD_SHARE of them loud. Gaps of up to gapWindows quiet
 //     windows (between syllables or steps) do not break it. A faint click or a short glitch of the camera never lasts
 //     that long.
+// - Wind: a window whose level above 1 kHz is more than lowRumbleDb (14 dB) below its full level counts for neither
+//   tier. Wind buffeting an outdoor microphone puts nearly all its energy below 300 Hz (often 35 dB and more between the
+//   two levels, even when the gust clips); breaking glass, a shout, a bark or a bang carry a good share above 1 kHz.
 // - Hold: detected stays on until holdMs after the last spike window.
 // - Step change: when the background itself jumps (a fan, rain) the loud windows stay out of the floor. A "run" starts
 //   at the first loud window and records EVERY window from then on (quiet gaps included) until runGapWindows quiet
@@ -38,6 +41,9 @@ export interface DetectorConfig {
     impulseDb: number;
     /** a loud impulse must also be at least this loud (dBFS). */
     impulseMinDb: number;
+    /** a window whose level above 1 kHz is more than this far below its full level is wind or rumble on the microphone:
+     *  it never counts as a sound (dB). */
+    lowRumbleDb: number;
     /** percentile of the floor history (0..1). */
     floorPercentile: number;
     /** windows in the floor history (5 min). */
@@ -64,6 +70,7 @@ export const DEFAULT_MIN_LEVEL_DB = -45;
 export const DEFAULT_DURATION_S = 1;
 export const DEFAULT_IMPULSE_DB = 25;
 export const DEFAULT_IMPULSE_LEVEL_DB = -30;
+export const DEFAULT_LOW_RUMBLE_DB = 14;
 /** a sustained sound needs at least this share of minSustainedWindows to be loud windows (gaps do not count) */
 export const MIN_LOUD_SHARE = 0.6;
 
@@ -75,6 +82,7 @@ export const DEFAULT_DETECTOR: DetectorConfig = {
     gapWindows: 2,
     impulseDb: DEFAULT_IMPULSE_DB,
     impulseMinDb: DEFAULT_IMPULSE_LEVEL_DB,
+    lowRumbleDb: DEFAULT_LOW_RUMBLE_DB,
     floorPercentile: 0.2,
     floorWindows: (5 * 60_000) / WINDOW_MS,
     learnWindows: 10_000 / WINDOW_MS,
@@ -198,8 +206,10 @@ export class AudioDetector {
         this.lastDb = w.db;
         const floor = this.floorDb;
         const flagged = floor !== undefined && w.db >= floor + c.sensitivityDb;
-        const loud = floor !== undefined && w.sustainedDb >= floor + c.sensitivityDb && w.sustainedDb >= c.absMinDb;
-        const impulse = floor !== undefined && w.db >= floor + c.impulseDb && w.db >= c.impulseMinDb;
+        // wind on the microphone: loud, but nearly nothing above 1 kHz
+        const rumble = w.highDb !== undefined && w.highDb < w.db - c.lowRumbleDb;
+        const loud = floor !== undefined && !rumble && w.sustainedDb >= floor + c.sensitivityDb && w.sustainedDb >= c.absMinDb;
+        const impulse = floor !== undefined && !rumble && w.db >= floor + c.impulseDb && w.db >= c.impulseMinDb;
         let rebaselined = false;
         const bin = binOf(w.db);
 
